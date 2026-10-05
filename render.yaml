@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: pdf-translator-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    branch: main
+    autoDeploy: false
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: ADMIN_ID
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        value: irbiolop/pdf-translator-bot
+      - key: GH_BRANCH
+        value: main
+      - key: PAGE_LIMIT
+        value: "40"
+      - key: FORCE_JOIN_ENABLED
+        value: "0"
+      - key: FORCE_JOIN_CHANNEL
+        value: ""
+      - key: PYTHON_VERSION
+        value: 3.12.7
