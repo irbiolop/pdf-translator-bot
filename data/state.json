@@ -1,6 +1,6 @@
 {
  "config": {
-  "page_limit": 40,
+  "page_limit": 500,
   "force_join": false,
   "channel": "",
   "speed": "fast"
@@ -8,8 +8,8 @@
  "users": {
   "7433357700": {
    "first": "2026-10-05",
-   "last": "2026-10-05 23:44",
-   "last_ts": 1791243840.3226235,
+   "last": "2026-10-05 23:46",
+   "last_ts": 1791243987.6353736,
    "username": "PrivateUssser",
    "name": "AliReza",
    "pages": 1,
