@@ -1,0 +1,25 @@
+name: Repo Keepalive (60-day guard)
+
+# گیت‌هاب workflowهای زمان‌بندی‌شده را بعد از ۶۰ روز بی‌فعالیتی مخزن خاموش می‌کند؛
+# این جاب هر ۵ روز یک کامیت خالی می‌زند تا تایمر ۶۰ روزه همیشه صفر شود.
+on:
+  schedule:
+    - cron: "0 4 */5 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Empty commit
+        run: |
+          git config user.name "keepalive-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive $(date -u '+%Y-%m-%d')"
+          git push
