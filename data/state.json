@@ -1,0 +1,21 @@
+{
+ "config": {
+  "page_limit": 40,
+  "force_join": false,
+  "channel": "",
+  "speed": "fast"
+ },
+ "users": {
+  "7433357700": {
+   "first": "2026-10-05",
+   "last": "2026-10-05 23:37",
+   "last_ts": 1791243421.3040578,
+   "username": "PrivateUssser",
+   "name": "AliReza"
+  }
+ },
+ "totals": {
+  "files": 0,
+  "pages": 0
+ }
+}
