@@ -1,0 +1,84 @@
+name: Bot (24/7)
+
+# ربات مترجم روی خود GitHub Actions اجرا می‌شود:
+#  • هر جاب حداکثر ۶ ساعت می‌تواند زنده باشد (سقف سخت GitHub) →
+#    ربات خودش بعد از ~۵ ساعت تمیز خارج می‌شود و این workflow دوباره خودش را
+#    اجرا می‌کند (زنجیرهٔ بی‌پایان = آپ‌تایم ۲۴/۷ با گپ چند دقیقه‌ای).
+#  • کرون هر ۶ ساعت فقط پشتیبان است (اگر زنجیره به هر دلیل قطع شده باشد).
+#  • concurrency جلوی اجرای موازی دو نمونه را می‌گیرد (تلگرام 409 نمی‌دهد).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 1,7,13,19 * * *"
+
+permissions:
+  contents: write   # کامیت وضعیت (data/state.json)
+  actions: write    # dispatch چرخهٔ بعدی
+
+concurrency:
+  group: tg-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340   # > زمان چرخهٔ ربات (۳۰۰ دقیقه) با حاشیهٔ نصب
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: نصب وابستگی‌ها
+        run: pip install -r requirements.txt
+
+      - name: 🛡 جلوگیری از اجرای موازی
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep $((RANDOM % 30 + 10))
+          N=$(gh run list --workflow=bot.yml --status in_progress --limit 20 --json databaseId --jq 'length')
+          echo "in_progress=$N"
+          if [ "$N" -gt 1 ]; then
+            echo "نمونهٔ دیگری از ربات فعال است؛ این اجرا رد می‌شود."
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: ▶️ اجرای ربات
+        id: bot
+        if: steps.guard.outputs.skip == '0'
+        run: |
+          python bot.py
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+          RUN_MAX_MINUTES: "300"
+
+      - name: 🔁 زنجیرهٔ ری‌استارت (ضد سقف ۶ ساعتهٔ GitHub)
+        if: always() && (steps.bot.outcome == 'success' || steps.bot.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CODE="${{ steps.bot.outputs.code }}"
+          if [ "$CODE" = "3" ]; then
+            echo "تداخل getUpdates؛ ۲ دقیقه صبر…"
+            sleep 120
+          elif [ "${{ steps.bot.outcome }}" = "failure" ]; then
+            echo "خطای عمومی؛ ۱۵ دقیقه صبر قبل از چرخهٔ بعد…"
+            sleep 900
+          fi
+          gh workflow run bot.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            && echo "چرخهٔ بعدی dispatch شد ✅" \
+            || echo "dispatch ناموفق (workflow شاید غیرفعال باشد)."

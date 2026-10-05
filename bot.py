@@ -6,8 +6,10 @@
 - پولینگ طولانی تلگرام با requests (بدون وابستگی سنگین)
 - ترجمه با translator_core (Groq) با حفظ چیدمان آینه‌ای و اندازهٔ یکنواخت
 - پنل ادمین داخل ربات: سقف صفحه، کانال اجباری، سرعت ترجمه، آمار کاربران
-- ذخیرهٔ وضعیت (تنظیمات/آمار) در مخزن GitHub تا با ری‌استارت/خواب Render از دست نرود
-- وب‌سرور کوچک /health برای keep-alive با GitHub Actions
+- ذخیرهٔ وضعیت (تنظیمات/آمار) در مخزن GitHub تا با ری‌استارت از دست نرود
+- وب‌سرور کوچک /health (برای استقرار روی Render)
+- حالت GitHub Actions: با RUN_MAX_MINUTES قبل از سقف ۶ ساعتهٔ جاب،
+  به‌صورت تمیز خارج می‌شود و workflow بعدی را خودش زنجیر می‌کند (۲۴/۷)
 """
 from __future__ import annotations
 
@@ -41,6 +43,9 @@ DEFAULT_PAGE_LIMIT = int(os.environ.get("PAGE_LIMIT", "40") or 40)
 FORCE_JOIN_ENABLED = os.environ.get("FORCE_JOIN_ENABLED", "0") == "1"
 FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "").strip()
 PORT = int(os.environ.get("PORT", "10000") or 10000)
+# سقف زمان هر چرخه (دقیقه). روی GitHub Actions باید < سقف ۶ ساعتهٔ جاب باشد؛
+# صفر یعنی بدون سقف (اجرای محلی/Render).
+RUN_MAX_MINUTES = float(os.environ.get("RUN_MAX_MINUTES", "0") or 0)
 
 TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_REPO_PATH = "data/state.json"
@@ -662,7 +667,12 @@ def handle_update(upd: dict) -> None:
 def polling_loop() -> None:
     offset = 0
     backoff = 2
+    conflicts = 0
     while not stop_event.is_set():
+        # حالت Actions: پایان تمیز چرخه قبل از سقف ۶ ساعتهٔ جاب
+        if RUN_MAX_MINUTES and time.time() - start_ts > RUN_MAX_MINUTES * 60:
+            log(f"زمان چرخه تمام شد ({RUN_MAX_MINUTES:.0f} دقیقه) — پایان تمیز.")
+            return
         try:
             r = requests.get(f"{TG}/getUpdates", params={
                 "offset": offset, "timeout": 30,
@@ -675,7 +685,17 @@ def polling_loop() -> None:
                 offset = upd["update_id"] + 1
                 handle_update(upd)
             backoff = 2
+            conflicts = 0
         except Exception as e:  # noqa: BLE001
+            # اگر دو نمونهٔ ربات همزمان پولینگ کنند، تلگرام 409 Conflict می‌دهد؛
+            # با کد خروج ۳ به workflow می‌گوییم سریع و بدون اخلال چرخهٔ بعد را بسازد.
+            if "Conflict" in str(e) and "getUpdates" in str(e):
+                conflicts += 1
+                if conflicts >= 3:
+                    log("تداخل پایدار با نمونهٔ دیگر — خروج با کد ۳.")
+                    sys.exit(3)
+            else:
+                conflicts = 0
             log(f"polling: {e} — تلاش مجدد بعد از {backoff}s")
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
@@ -691,6 +711,8 @@ def main() -> None:
         sys.exit(f"متغیر محیطی تنظیم نشده: {', '.join(missing)}")
     BOT_USERNAME = (api("getMe", timeout=20) or {}).get("username", "")
     log(f"ربات @{BOT_USERNAME} روشن شد. مدل: {GROQ_MODEL} | ادمین: {ADMIN_ID}")
+    if RUN_MAX_MINUTES:
+        log(f"حالت GitHub Actions: هر چرخه {RUN_MAX_MINUTES:.0f} دقیقه و بعد ری‌استارت زنجیره‌ای.")
     try:
         api("setMyCommands", commands=[
             {"command": "start", "description": "شروع"},
@@ -717,6 +739,20 @@ def main() -> None:
     signal.signal(signal.SIGTERM, bye)
     signal.signal(signal.SIGINT, bye)
     polling_loop()
+
+    # فقط در پایان تمیز چرخه (حالت Actions) به اینجا می‌رسیم؛
+    # اول کارِ در جریان را تمام می‌کنیم، بعد وضعیت را ذخیره و خارج می‌شویم.
+    if RUN_MAX_MINUTES:
+        log("در انتظار پایان ترجمهٔ در جریان (حداکثر ۲۵ دقیقه)…")
+        deadline = time.time() + 25 * 60
+        while (worker_busy.is_set() or not job_q.empty()) and time.time() < deadline:
+            time.sleep(5)
+        stop_event.set()
+        try:
+            commit_state("cycle-end")
+        except Exception as e:  # noqa: BLE001
+            log(f"کامیت پایان چرخه ناموفق بود: {e}")
+        log("چرخه تمام شد ✅")
 
 
 if __name__ == "__main__":
