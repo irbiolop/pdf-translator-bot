@@ -8,14 +8,16 @@
  "users": {
   "7433357700": {
    "first": "2026-10-05",
-   "last": "2026-10-05 23:37",
-   "last_ts": 1791243421.3040578,
+   "last": "2026-10-05 23:44",
+   "last_ts": 1791243840.3226235,
    "username": "PrivateUssser",
-   "name": "AliReza"
+   "name": "AliReza",
+   "pages": 1,
+   "files": 1
   }
  },
  "totals": {
-  "files": 0,
-  "pages": 0
+  "files": 1,
+  "pages": 1
  }
 }
