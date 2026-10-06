@@ -3,7 +3,9 @@
   "page_limit": 500,
   "force_join": false,
   "channel": "",
-  "speed": "fast"
+  "speed": "fast",
+  "provider": "ttai",
+  "model": "Top-Tools-Ai"
  },
  "users": {
   "7433357700": {
