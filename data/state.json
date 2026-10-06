@@ -14,12 +14,14 @@
    "last_ts": 1791317260.0391788,
    "username": "PrivateUssser",
    "name": "AliReza",
-   "pages": 20,
-   "files": 2
+   "pages": 32,
+   "files": 3,
+   "tokens": 61665
   }
  },
  "totals": {
-  "files": 2,
-  "pages": 20
+  "files": 3,
+  "pages": 32,
+  "tokens": 61665
  }
 }
