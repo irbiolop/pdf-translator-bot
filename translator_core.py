@@ -269,6 +269,7 @@ def extract_blocks(page: "pymupdf.Page") -> list[dict]:
         blocks.append({
             "bbox": bbox,
             "line_rects": line_rects,
+            "raw_lines": raw_lines,
             "text": text,
             "size": size,
             "leading": leading,
@@ -283,6 +284,124 @@ def extract_blocks(page: "pymupdf.Page") -> list[dict]:
 # --------------------------------------------------------------------------
 # فراخوانی وب‌سرویس ترجمه (سازگار OpenAI)
 # --------------------------------------------------------------------------
+
+
+def _union_rects(rects: list["pymupdf.Rect"]) -> "pymupdf.Rect":
+    u = pymupdf.Rect(rects[0])
+    for r in rects[1:]:
+        u |= r
+    return u
+
+
+def _split_blocks_by_tables(page: "pymupdf.Page", blocks: list[dict],
+                            log=print) -> list[dict]:
+    """بلوک‌های داخل جدول را به‌ازای هر سلول جدا می‌کند.
+
+    بدون این کار، سلول‌های یک ردیف جدول در یک بلوک می‌افتند و ترجمه‌شان به‌صورت
+    یک پاراگراف روی چند خانه می‌نشیند و از خطوط شبکه بیرون می‌زند. با جداسازی،
+    ترجمهٔ هر سلول در خانهٔ آینه‌شدهٔ خودش درج می‌شود.
+    """
+    if len(blocks) < 2:
+        return blocks
+    try:
+        tabs = page.find_tables()
+        tables = [t for t in tabs.tables
+                  if t.row_count >= 2 and t.col_count >= 2]
+    except Exception:  # noqa: BLE001
+        return blocks
+    if not tables:
+        return blocks
+
+    # تک‌تک سلول‌های همهٔ جدول‌ها (سلول‌های ادغام‌شده فقط یک‌بار)
+    all_cells: list[pymupdf.Rect] = []
+    seen = set()
+    for t in tables:
+        for row in t.rows:
+            for c in (row.cells or []):
+                if not c:
+                    continue
+                key = (round(c[0], 1), round(c[1], 1), round(c[2], 1), round(c[3], 1))
+                if key not in seen:
+                    seen.add(key)
+                    all_cells.append(pymupdf.Rect(c))
+    if len(all_cells) < 2:
+        return blocks
+
+    # هر خطِ متن در سلولی می‌افتد که مرکزش داخل آن است
+    per_cell: list[list[tuple[int, int]]] = [[] for _ in all_cells]
+    for bi, b in enumerate(blocks):
+        for li, lr in enumerate(b["line_rects"]):
+            cx, cy = (lr.x0 + lr.x1) / 2, (lr.y0 + lr.y1) / 2
+            for ci, cell in enumerate(all_cells):
+                if cell.x0 - 1 <= cx <= cell.x1 + 1 and cell.y0 - 1 <= cy <= cell.y1 + 1:
+                    per_cell[ci].append((bi, li))
+                    break
+
+    consumed_pairs: set[tuple[int, int]] = set()
+    consumed_blocks: set[int] = set()
+    cell_blocks: list[dict] = []
+    for ci, items in enumerate(per_cell):
+        if not items:
+            continue
+        cell = all_cells[ci]
+        cnt: dict[int, int] = {}
+        for bi, li in items:
+            cnt[bi] = cnt.get(bi, 0) + 1
+        # اگر هر بلوکِ درگیر کامل داخل همین سلول است، دست نمی‌زنیم
+        if all(cnt[bi] == len(blocks[bi]["line_rects"]) for bi in cnt):
+            continue
+        clipped: list[pymupdf.Rect] = []
+        raws: list[str] = []
+        src = blocks[items[0][0]]
+        for bi, li in items:
+            lr = blocks[bi]["line_rects"][li]
+            cr = pymupdf.Rect(max(lr.x0, cell.x0), max(lr.y0, cell.y0),
+                              min(lr.x1, cell.x1), min(lr.y1, cell.y1))
+            if cr.is_empty or cr.width <= 1:
+                continue
+            consumed_pairs.add((bi, li))
+            consumed_blocks.add(bi)
+            clipped.append(cr)
+            raws.append(blocks[bi]["raw_lines"][li] if li < len(blocks[bi].get("raw_lines", []))
+                        else blocks[bi]["text"])
+        if not clipped:
+            continue
+        bbox = _union_rects(clipped)
+        cell_blocks.append({
+            "bbox": bbox,
+            "line_rects": clipped,
+            "raw_lines": raws,
+            "text": _join_lines(raws),
+            "size": src["size"],
+            "leading": src["leading"],
+            "bold": src["bold"],
+            "italic": src["italic"],
+            "color": src["color"],
+            "align": _detect_align(bbox, clipped),
+        })
+
+    if not cell_blocks:
+        return blocks
+    log(f"{len(cell_blocks)} سلول جدول جدا و مستقل ترجمه می‌شود.")
+
+    out: list[dict] = []
+    for bi, b in enumerate(blocks):
+        if bi not in consumed_blocks:
+            out.append(b)
+            continue
+        resid = [li for li in range(len(b["line_rects"])) if (bi, li) not in consumed_pairs]
+        if resid:
+            lrs = [b["line_rects"][li] for li in resid]
+            raws = [b["raw_lines"][li] for li in resid]
+            nb = dict(b)
+            nb["line_rects"] = lrs
+            nb["raw_lines"] = raws
+            nb["bbox"] = _union_rects(lrs)
+            nb["text"] = _join_lines(raws)
+            nb["align"] = _detect_align(nb["bbox"], lrs)
+            out.append(nb)
+    out.extend(cell_blocks)
+    return out
 
 
 def _batch_items(items: list[tuple[int, str]], max_chars: int = 6000) -> list[list[tuple[int, str]]]:
@@ -559,6 +678,97 @@ def _apply_redactions(page: "pymupdf.Page") -> None:
         page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE)
 
 
+def _remove_images(page: "pymupdf.Page", bboxes: list["pymupdf.Rect"]) -> None:
+    """حذف استقرار تصاویر از صفحه (برای بازدرج در موقعیت آینه‌ای)."""
+    for r in bboxes:
+        page.add_redact_annot(pymupdf.Rect(r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 0.5))
+    try:
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_REMOVE,
+                              graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
+    except (TypeError, AttributeError):
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_REMOVE)
+
+
+def _mirror_rect(r: "pymupdf.Rect", page_w: float) -> "pymupdf.Rect":
+    """آینهٔ افقی یک رکت حول محور عمودی وسط صفحه."""
+    return pymupdf.Rect(page_w - r.x1, r.y0, page_w - r.x0, r.y1)
+
+
+def _page_flippable(page: "pymupdf.Page") -> bool:
+    """شرط‌های امن برای آینه‌کردن کل محتوای گرافیکی صفحه:
+    چرخش صفر و منطبق‌بودن ناحیهٔ دید با MediaBox (تا محور آینه درست باشد)."""
+    try:
+        if page.rotation != 0:
+            return False
+        mb = page.mediabox
+        pr = page.rect
+        return (abs(mb.x0) < 0.01 and abs(mb.y0) < 0.01
+                and abs(pr.width - mb.width) < 0.01
+                and abs(pr.height - mb.height) < 0.01)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _flip_page_graphics(doc, page: "pymupdf.Page") -> None:
+    """محتوای باقی‌ماندهٔ صفحه (جدول‌ها، کادرها، خطوط و هر ترسیم برداری) را
+    حول محور عمودی وسط صفحه آینهٔ افقی می‌کند.
+
+    در این نقطه متن‌ها حذف و تصاویر جمع‌آوری شده‌اند؛ این تابع فقط ترسیم‌های
+    برداری را می‌گیرد تا شبکهٔ جدول‌ها و کادرها با متن آینه‌شده هم‌تراز بمانند.
+    با پیچیدن کل جریان محتوا در «q + ماتریس آینه + Q» انجام می‌شود.
+    """
+    page.wrap_contents()  # تضمین توازن q/Q در جریان‌های موجود
+    xrefs = page.get_contents()
+    if not xrefs:
+        return
+    e = page.mediabox.x0 + page.mediabox.x1   # x' = -x + e  (آینهٔ افقی)
+    cm = f"q\n-1 0 0 1 {e:.3f} 0 cm\n".encode()
+    first = doc.xref_stream(xrefs[0])
+    doc.update_stream(xrefs[0], cm + first)
+    last_xref = xrefs[-1]
+    last = doc.xref_stream(last_xref)
+    doc.update_stream(last_xref, last + b"\nQ\n")
+
+
+def _collect_images(page: "pymupdf.Page") -> list[dict]:
+    """تصاویر شطرنجیِ مستقر در صفحه با xref معتبر برای جابه‌جایی."""
+    imgs: list[dict] = []
+    try:
+        for info in page.get_image_info(xrefs=True):
+            xref = int(info.get("xref", 0) or 0)
+            bbox = info.get("bbox")
+            if xref > 0 and bbox:
+                r = pymupdf.Rect(bbox)
+                if not r.is_empty and r.width > 1 and r.height > 1:
+                    imgs.append({"xref": xref, "bbox": r})
+    except Exception:  # noqa: BLE001
+        pass
+    return imgs
+
+
+def _reinsert_images(doc, page: "pymupdf.Page", imgs: list[dict], page_w: float,
+                     log=print) -> None:
+    """بازدرج تصاویر جمع‌آوری‌شده در موقعیت آینه‌ای — باید بعد از _flip_page_graphics
+    اجرا شود تا جریان جدیدِ تصویر زیر ماتریس آینه نرود و محتوایش برعکس نشود."""
+    moved = 0
+    for im in imgs:
+        mr = _mirror_rect(im["bbox"], page_w)
+        if mr.is_empty or mr.width <= 1 or mr.height <= 1:
+            continue
+        try:
+            page.insert_image(mr, xref=im["xref"])  # ارجاع به همان شیء (با شفافیت)
+            moved += 1
+        except Exception:  # noqa: BLE001
+            try:
+                raw = doc.extract_image(im["xref"])
+                page.insert_image(mr, stream=raw["image"])
+                moved += 1
+            except Exception:  # noqa: BLE001
+                pass
+    if moved:
+        log(f"{moved} تصویر به موقعیت آینه‌ای منتقل شد.")
+
+
 def _finalize_save(doc, out_path, log=print) -> None:
     """ذخیرهٔ نهایی با فشرده‌سازی کامل برای کاهش حجم فایل خروجی:
 
@@ -582,9 +792,11 @@ def _finalize_save(doc, out_path, log=print) -> None:
              deflate_fonts=True, clean=True)
 
 
-def _fit_rect(b: dict, rect: "pymupdf.Rect", page_rect: "pymupdf.Rect") -> "pymupdf.Rect":
+def _fit_rect(b: dict, rect: "pymupdf.Rect", page_rect: "pymupdf.Rect",
+              siblings: list["pymupdf.Rect"] | None = None) -> "pymupdf.Rect":
     """کادرهای خیلی باریک (مثل شمارهٔ صفحه) را برای جای‌دادن متن فارسی گسترش می‌دهد،
-    بدون جابه‌جا کردن لبهٔ لنگرِ چینش."""
+    بدون جابه‌جا کردن لبهٔ لنگرِ چینش. اگر گسترش به بلوک مجاور (مثل سلول کناری
+    جدول یا خط شبکهٔ آن) سرریز شود، گسترش لغو می‌شود تا متن از خانه بیرون نزند."""
     if rect.width <= 0 or rect.width >= b["size"] * 3:
         return rect
     extra = b["size"] * 6
@@ -594,6 +806,12 @@ def _fit_rect(b: dict, rect: "pymupdf.Rect", page_rect: "pymupdf.Rect") -> "pymu
         nr = pymupdf.Rect(rect.x0 - extra, rect.y0, rect.x1, rect.y1)
     nr.x0 = max(nr.x0, page_rect.x0 + 2)
     nr.x1 = min(nr.x1, page_rect.x1 - 2)
+    for s in (siblings or []):
+        try:
+            if nr.intersects(s):
+                return rect  # سرریز به همسایه — همان کادر باریک می‌ماند (متن کوچک می‌شود)
+        except Exception:  # noqa: BLE001
+            continue
     return nr
 
 
@@ -674,6 +892,8 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                 continue
             # جلوگیری از «متن روی متن»: بلوک‌های همپوشان ادغام می‌شوند
             blocks = _merge_overlapping_blocks(blocks)
+            # جدول‌ها: هر سلول یک بلوک مستقل تا ترجمه از خانه بیرون نزند
+            blocks = _split_blocks_by_tables(page, blocks, log=log)
 
             segs = [b["text"] for b in blocks]
             trans = [""] * len(segs)
@@ -725,7 +945,7 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                     for (idx, _), tr in zip(batch, outs):
                         trans[idx] = tr
 
-            # ۱) حذف متن اصلی صفحه
+            # ۱) حذف متن اصلی صفحه (تصاویر و گرافیک دست‌نخورده می‌مانند)
             for b in blocks:
                 for r in b["line_rects"]:
                     pr = pymupdf.Rect(r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 0.5)
@@ -738,8 +958,32 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
             for b in blocks:
                 r = b["bbox"]
                 if mirror:
-                    r = pymupdf.Rect(page_w - r.x1, r.y0, page_w - r.x0, r.y1)
+                    r = _mirror_rect(b["bbox"], page_w)
                 rects.append(r)
+
+            # ۲٫۵) آینه‌سازی محتوای گرافیکی: جدول‌ها/کادرها/خطوط با متن هم‌تراز می‌شوند و
+            #      تصاویر به موقعیت آینه‌ای منتقل می‌شوند (بدون برعکس‌شدن محتوای خودشان)
+            if mirror and _page_flippable(page):
+                try:
+                    imgs = _collect_images(page)
+                    if imgs:
+                        # حذف استقرار فعلی (با مختصات اصلی، قبل از فلیپ)
+                        _remove_images(page, [im["bbox"] for im in imgs])
+                    # فلیپ فقط ترسیم‌های برداری باقی‌مانده را آینه می‌کند
+                    _flip_page_graphics(doc, page)
+                    # بازدرج تصاویر بعد از فلیپ → زیر ماتریس آینه نمی‌روند
+                    _reinsert_images(doc, page, imgs, page_w, log=log)
+                except Exception as e:  # noqa: BLE001
+                    log(f"صفحهٔ {pno + 1}: آینه‌سازی گرافیک ناموفق بود: {e}")
+                # لینک‌ها هم به موقعیت آینه‌ای می‌روند
+                try:
+                    for lnk in page.get_links():
+                        fr = lnk.get("from")
+                        if fr is not None:
+                            lnk["from"] = _mirror_rect(fr, page_w)
+                            page.update_link(lnk)
+                except Exception:  # noqa: BLE001
+                    pass
 
             # ۳) مقیاس یکنواخت صفحه: کمترین مقیاسی که همهٔ پاراگراف‌ها جا شوند؛
             #    همهٔ بلوک‌ها با همان ضریب کوچک می‌شوند تا اندازه‌ها یکنواخت بماند
@@ -762,7 +1006,8 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                 if s_own < page_scale:
                     log(f"صفحهٔ {pno + 1}: یک بلوک با مقیاس {int(s_own * 100)}٪ درج شد "
                         f"(در مقیاس یکنواختِ {int(page_scale * 100)}٪ جا نشد).")
-                rect = _fit_rect(b, rects[i], page.rect)
+                rect = _fit_rect(b, rects[i], page.rect,
+                                 siblings=[rects[j] for j in range(len(rects)) if j != i])
                 if rect.is_empty or rect.width <= 2 or rect.height <= 2:
                     continue
                 try:
