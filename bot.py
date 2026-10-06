@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import base64
+import html as html_mod
 import json
 import os
 import queue
@@ -34,7 +35,8 @@ import translator_core as core
 # --------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.environ.get("GROQ_MODEL", core.DEFAULT_MODEL).strip()
+TT_API_KEY = os.environ.get("TT_API_KEY", "").strip()
+TT_BASE = (os.environ.get("TT_BASE", "https://top-tools-ai.com/api/v1").strip().rstrip("/"))
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 GH_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GH_REPO = os.environ.get("GITHUB_REPO", "").strip()  # owner/name
@@ -47,15 +49,61 @@ PORT = int(os.environ.get("PORT", "10000") or 10000)
 # صفر یعنی بدون سقف (اجرای محلی/Render).
 RUN_MAX_MINUTES = float(os.environ.get("RUN_MAX_MINUTES", "0") or 0)
 
+DEFAULT_PROVIDER = os.environ.get("API_PROVIDER", "ttai").strip() or "ttai"
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "Top-Tools-Ai").strip() or "Top-Tools-Ai"
+
+# دو سرویس سازگار با OpenAI: پیش‌فرض Top Tools AI (سهمیهٔ ۱۰M توکن در روز +
+# حداکثر ۵ درخواست همزمان) و Groq به‌عنوان جایگزین (سقف ~۸هزار توکن در دقیقه).
+PROVIDERS = {
+    "ttai": {
+        "label": "Top Tools AI",
+        "base": f"{TT_BASE}/chat/completions",
+        "key": TT_API_KEY,
+        "parallel": True,
+        "models": list(core.TTAI_MODELS),
+    },
+    "groq": {
+        "label": "Groq",
+        "base": core.GROQ_API_URL,
+        "key": GROQ_KEY,
+        "parallel": False,
+        "models": list(core.FREE_MODELS),
+    },
+}
+
+
+def engine() -> dict:
+    """سرویس و مدل فعال فعلی (از تنظیمات ادمین خوانده می‌شود)."""
+    with state_lock:
+        prov = state["config"].get("provider", DEFAULT_PROVIDER)
+        model = state["config"].get("model", DEFAULT_MODEL)
+    if prov not in PROVIDERS:
+        prov = "ttai"
+    p = PROVIDERS[prov]
+    if model not in p["models"]:
+        model = p["models"][0]
+    return {"prov": prov, "label": p["label"], "base": p["base"], "key": p["key"],
+            "parallel": p["parallel"], "models": p["models"], "model": model}
+
 TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_REPO_PATH = "data/state.json"
 TMP_DIR = Path("data/tmp")
 
-# «سریع‌ترین زمان ممکن» = کمترین مکثی که با سقف ~۸هزار توکن در دقیقهٔ تیر فری
-# بدون رگبار 429 می‌چرخد؛ 429ها هم خودکار طبق retry-after مدیریت می‌شوند.
-SPEEDS = {"fast": 15.0, "balanced": 25.0, "safe": 40.0}
-SPEED_LABELS = {"fast": "حداکثر سرعت (۱۵ث)", "balanced": "متعادل (۲۵ث)", "safe": "محتاط (۴۰ث)"}
+# «سریع‌ترین زمان ممکن»:
+#   • Top Tools AI: سقف ~۴۵RPM و ۵ درخواست همزمان → ترجمهٔ موازی چند صفحه با ورکرها؛
+#     (تعداد ورکر، فاصلهٔ شروع درخواست‌ها به ثانیه)
+#   • Groq: سقف ~۸هزار توکن در دقیقه → پشت‌سرهم با مکث بین صفحات.
+#     429ها در هر دو حالت خودکار طبق retry-after مدیریت می‌شوند.
+SPEEDS_TT = {"fast": (4, 1.4), "balanced": (3, 2.2), "safe": (2, 3.5)}
+SPEED_LABELS_TT = {"fast": "موازی ×۴ — سریع‌ترین", "balanced": "موازی ×۳ — متعادل", "safe": "موازی ×۲ — محتاط"}
+SPEEDS_GROQ = {"fast": 15.0, "balanced": 25.0, "safe": 40.0}
+SPEED_LABELS_GROQ = {"fast": "حداکثر سرعت (۱۵ث)", "balanced": "متعادل (۲۵ث)", "safe": "محتاط (۴۰ث)"}
 SPEED_ORDER = ["fast", "balanced", "safe"]
+
+
+def speed_label(speed: str) -> str:
+    labels = SPEED_LABELS_TT if engine()["parallel"] else SPEED_LABELS_GROQ
+    return labels.get(speed, speed)
 
 MAX_DOWNLOAD = 19 * 1024 * 1024   # سقف دانلود فایل در Bot API تلگرام
 MAX_QUEUE = 6                     # حداکثر فایل در صف
@@ -82,6 +130,8 @@ def _default_state() -> dict:
             "force_join": FORCE_JOIN_ENABLED,
             "channel": FORCE_JOIN_CHANNEL,
             "speed": "fast",
+            "provider": DEFAULT_PROVIDER,
+            "model": DEFAULT_MODEL,
         },
         "users": {},
         "totals": {"files": 0, "pages": 0},
@@ -300,8 +350,9 @@ def stats_text() -> str:
             f"📚 فایل‌های ترجمه‌شده: {totals.get('files', 0)}",
             f"📄 صفحه‌های ترجمه‌شده: {totals.get('pages', 0)}",
             f"⏳ صف فعلی: {job_q.qsize()}",
-            f"⚡ سرعت: {SPEED_LABELS.get(cfg.get('speed'), cfg.get('speed'))}",
-            f"🤖 مدل: <code>{GROQ_MODEL}</code>",
+            f"⚡ سرعت: {speed_label(cfg.get('speed'))}",
+            f"🤖 سرویس: {PROVIDERS.get(cfg.get('provider'), PROVIDERS['ttai'])['label']} — <code>{cfg.get('model')}</code>",
+            f"🧮 توکن مصرفی کل: {totals.get('tokens', 0):,}",
             f"⏱ آپ‌تایم: {(now - start_ts) // 60:.0f} دقیقه",
         ]
         if top:
@@ -309,7 +360,7 @@ def stats_text() -> str:
             lines.append("🏆 برترین کاربران:")
             for i, (uid, u) in enumerate(top, 1):
                 nm = (u.get("name") or "").strip() or u.get("username") or f"کاربر {uid}"
-                lines.append(f"{i}. {nm} — {u.get('pages', 0)} صفحه، {u.get('files', 0)} فایل")
+                lines.append(f"{i}. {nm} — {u.get('pages', 0)} صفحه، {u.get('files', 0)} فایل، {u.get('tokens', 0):,} توکن")
         return "\n".join(lines)
 
 
@@ -317,10 +368,13 @@ def admin_menu() -> dict:
     with state_lock:
         c = dict(state["config"])
     b = lambda t, d: {"text": t, "callback_data": d}  # noqa: E731
+    prov = PROVIDERS.get(c.get("provider"), PROVIDERS["ttai"])
     return {"inline_keyboard": [
         [b("📊 آمار کاربران", "ad:stats")],
-        [b(f"📄 سقف صفحه: {c.get('page_limit')}", "ad:limit"),
-         b(f"⚡ سرعت: {SPEED_LABELS.get(c.get('speed'), c.get('speed'))}", "ad:speed")],
+        [b(f"🤖 سرویس: {prov['label']}", "ad:provider"),
+         b(f"⚡ سرعت: {speed_label(c.get('speed'))}", "ad:speed")],
+        [b(f"🧠 مدل: {c.get('model')}", "ad:model")],
+        [b(f"📄 سقف صفحه: {c.get('page_limit')}", "ad:limit")],
         [b(f"📢 کانال اجباری: {'✅ روشن' if c.get('force_join') else '❌ خاموش'}", "ad:toggle")],
         [b(f"🔗 کانال: {c.get('channel') or '— تنظیم نشده —'}", "ad:channel")],
         [b("💾 ذخیرهٔ دستی وضعیت", "ad:sync")],
@@ -349,6 +403,22 @@ def handle_callback(cb: dict) -> None:
         with state_lock:
             idx = SPEED_ORDER.index(state["config"]["speed"]) if state["config"]["speed"] in SPEED_ORDER else 0
             state["config"]["speed"] = SPEED_ORDER[(idx + 1) % len(SPEED_ORDER)]
+        dirty.set()
+        edit(chat, mid, "پنل ادمین ⚙️", reply_markup=admin_menu())
+    elif data == "ad:provider":
+        with state_lock:
+            cur = state["config"].get("provider", DEFAULT_PROVIDER)
+            nxt = "groq" if cur == "ttai" else "ttai"
+            state["config"]["provider"] = nxt
+            state["config"]["model"] = PROVIDERS[nxt]["models"][0]
+        dirty.set()
+        edit(chat, mid, "پنل ادمین ⚙️", reply_markup=admin_menu())
+    elif data == "ad:model":
+        with state_lock:
+            prov = state["config"].get("provider", DEFAULT_PROVIDER)
+            models = PROVIDERS.get(prov, PROVIDERS["ttai"])["models"]
+            cur = state["config"].get("model", DEFAULT_MODEL)
+            state["config"]["model"] = models[(models.index(cur) + 1) % len(models)] if cur in models else models[0]
         dirty.set()
         edit(chat, mid, "پنل ادمین ⚙️", reply_markup=admin_menu())
     elif data == "ad:toggle":
@@ -411,8 +481,9 @@ WELCOME = (
     "👋 <b>مترجم PDF انگلیسی → فارسی</b>\n\n"
     "فایل PDF انگلیسی را بفرست تا با حفظ چیدمان (موقعیت، اندازه، بولد/رنگ) "
     "به فارسی ترجمه و راست‌به‌چپ برگردانده شود.\n\n"
-    f"📄 سقف فعلی: تا <b>{{limit}}</b> صفحه برای هر فایل\n"
-    f"🤖 مدل: <code>{GROQ_MODEL}</code>\n\n"
+    "📄 سقف فعلی: تا <b>{limit}</b> صفحه برای هر فایل\n"
+    "🤖 موتور: {engine} — مدل <code>{model}</code>\n"
+    "⚡ صفحات به‌صورت <b>موازی</b> ترجمه می‌شوند تا سریع‌ترین جواب را بگیری\n\n"
     "💡 فقط کافیست فایل را بفرست؛ پیشرفت ترجمه را همین‌جا نشان می‌دهم."
 )
 
@@ -437,7 +508,8 @@ def cmd_start(m: dict) -> None:
         return
     with state_lock:
         pl = int(state["config"].get("page_limit", 40))
-    send(chat, WELCOME.format(limit=pl))
+    eng = engine()
+    send(chat, WELCOME.format(limit=pl, engine=eng["label"], model=eng["model"]))
 
 
 def on_document(m: dict) -> None:
@@ -465,7 +537,8 @@ def on_document(m: dict) -> None:
         send(chat, "صف ربات پر است؛ چند دقیقه بعد دوباره امتحان کن.")
         return
     user_pending.add(uid)
-    job_q.put({"chat": chat, "uid": uid, "file_id": doc["file_id"], "name": name})
+    job_q.put({"chat": chat, "uid": uid, "file_id": doc["file_id"], "name": name,
+               "uname": (m.get("from", {}) or {}).get("username") or ""})
     send(chat, f"🟡 فایل در صف قرار گرفت (جایگاه {job_q.qsize()}). "
                "به‌محض شروع ترجمه خبر می‌دهم.")
 
@@ -518,8 +591,17 @@ def process_job(job: dict) -> None:
         return
 
     with state_lock:
-        delay = SPEEDS.get(state["config"].get("speed", "fast"), 15.0)
-    upd(f"🌍 شروع ترجمهٔ <b>{n_pages}</b> صفحه با <code>{GROQ_MODEL}</code>…", force=True)
+        speed = state["config"].get("speed", "fast")
+    eng = engine()
+    if not eng["key"]:
+        edit(chat, stid, f"❌ کلید سرویس {eng['label']} تنظیم نشده است؛ به ادمین خبر بده.")
+        in_pdf.unlink(missing_ok=True)
+        return
+    if eng["parallel"]:
+        w, sp = SPEEDS_TT.get(speed, SPEEDS_TT["fast"])
+        upd(f"🌍 شروع ترجمهٔ موازی <b>{n_pages}</b> صفحه با <code>{eng['model']}</code> ({w} ورکر)…", force=True)
+    else:
+        upd(f"🌍 شروع ترجمهٔ <b>{n_pages}</b> صفحه با <code>{eng['model']}</code>…", force=True)
     t0 = time.time()
 
     def progress(done: int, total: int) -> None:
@@ -528,19 +610,27 @@ def process_job(job: dict) -> None:
         upd(f"🔄 ترجمه: {bar} {done}/{total} صفحه ({pct}٪)")
 
     try:
-        core.translate_pdf(str(in_pdf), str(out_pdf), GROQ_KEY, model=GROQ_MODEL,
-                           delay=delay, progress=progress, cancelled=None,
-                           log=lambda *a: None, mirror=True)
-    except core.FatalTranslationError as e:
-        edit(chat, stid, f"❌ خطای پیکربندی ترجمه: <code>{e}</code>\n"
-                         "این مشکل کلید/مدل است؛ به ادمین خبر بده.")
+        if eng["parallel"]:
+            res = core.translate_pdf(str(in_pdf), str(out_pdf), eng["key"], model=eng["model"],
+                                     base_url=eng["base"], workers=w, spacing=sp,
+                                     progress=progress, cancelled=None,
+                                     log=lambda *a: None, mirror=True)
+        else:
+            res = core.translate_pdf(str(in_pdf), str(out_pdf), eng["key"], model=eng["model"],
+                                     base_url=eng["base"], delay=SPEEDS_GROQ.get(speed, 15.0),
+                                     progress=progress, cancelled=None,
+                                     log=lambda *a: None, mirror=True)
+    except core.FatalTranslationError as err:
+        edit(chat, stid, f"❌ خطای پیکربندی ترجمه: <code>{err}</code>\n"
+                         "این مشکل کلید/مدل/اشتراک است؛ به ادمین خبر بده.")
         in_pdf.unlink(missing_ok=True)
         return
-    except core.TranslationError as e:
-        edit(chat, stid, f"❌ ترجمه ناتمام ماند: <code>{e}</code>\n"
+    except core.TranslationError as err:
+        edit(chat, stid, f"❌ ترجمه ناتمام ماند: <code>{err}</code>\n"
                          "سرویس ترجمه شلوغ است؛ چند دقیقه بعد دوباره امتحان کن.")
         in_pdf.unlink(missing_ok=True)
         return
+    usage = (res or {}).get("usage", {})
 
     secs = time.time() - t0
     upd("📤 در حال ارسال فایل ترجمه‌شده…", force=True)
@@ -555,14 +645,32 @@ def process_job(job: dict) -> None:
     in_pdf.unlink(missing_ok=True)
     out_pdf.unlink(missing_ok=True)
 
+    total_tokens = int(usage.get("total_tokens", 0) or 0)
     with state_lock:
         rec = state["users"].setdefault(str(uid), {})
         rec["pages"] = rec.get("pages", 0) + n_pages
         rec["files"] = rec.get("files", 0) + 1
+        rec["tokens"] = rec.get("tokens", 0) + total_tokens
         state["totals"]["files"] = state["totals"].get("files", 0) + 1
         state["totals"]["pages"] = state["totals"].get("pages", 0) + n_pages
+        state["totals"]["tokens"] = state["totals"].get("tokens", 0) + total_tokens
     dirty.set()
-    log(f"فایل «{name}» ({n_pages} صفحه) برای {uid} در {secs:.0f}s ترجمه شد.")
+    log(f"فایل «{name}» ({n_pages} صفحه) برای {uid} در {secs:.0f}s ترجمه شد ({total_tokens:,} توکن).")
+
+    # گزارش مصرف توکن هر فایل برای ادمین
+    if ADMIN_ID:
+        try:
+            uname = job.get("uname") or ""
+            send(ADMIN_ID,
+                 "📊 <b>گزارش مصرف توکن</b>\n"
+                 f"📄 فایل: <code>{html_mod.escape(name)}</code>\n"
+                 f"👤 کاربر: <code>{uid}</code>" + (f" (@{uname})" if uname else "") + "\n"
+                 f"📑 صفحات: {n_pages} | ⏱ {secs / 60:.1f} دقیقه\n"
+                 f"🔤 ورودی: {usage.get('prompt_tokens', 0):,} | خروجی: {usage.get('completion_tokens', 0):,}\n"
+                 f"🧮 مجموع: <b>{total_tokens:,}</b> توکن در {usage.get('api_calls', 0)} درخواست\n"
+                 f"🤖 {eng['label']} / <code>{eng['model']}</code>")
+        except TgError:
+            pass
 
 
 def worker() -> None:
@@ -601,7 +709,8 @@ def health_server() -> None:
                 "queue": job_q.qsize(),
                 "busy": worker_busy.is_set(),
                 "users": len(state.get("users", {})),
-                "model": GROQ_MODEL,
+                "provider": state.get("config", {}).get("provider"),
+                "model": state.get("config", {}).get("model"),
                 "speed": state.get("config", {}).get("speed"),
             }, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
@@ -643,11 +752,12 @@ def handle_message(m: dict) -> None:
     elif text.startswith("/admin") and is_admin(uid):
         send(chat_id, "پنل ادمین ⚙️", reply_markup=admin_menu())
     elif text.startswith("/ping") and is_admin(uid):
+        eng = engine()
         try:
-            core.selftest(GROQ_KEY, GROQ_MODEL, log=lambda *a: None)
-            send(chat_id, "✅ اتصال Groq برقرار است و مدل پاسخ داد.")
+            core.selftest(eng["key"], eng["model"], log=lambda *a: None, base_url=eng["base"])
+            send(chat_id, f"✅ اتصال {eng['label']} برقرار است و مدل <code>{eng['model']}</code> پاسخ داد.")
         except Exception as e:  # noqa: BLE001
-            send(chat_id, f"❌ خطای Groq: <code>{e}</code>")
+            send(chat_id, f"❌ خطای {eng['label']}: <code>{e}</code>")
     elif "document" in m:
         on_document(m)
     elif text:
@@ -706,11 +816,13 @@ def polling_loop() -> None:
 # --------------------------------------------------------------------------
 def main() -> None:
     global BOT_USERNAME
-    missing = [k for k, v in (("TELEGRAM_TOKEN", BOT_TOKEN), ("GROQ_API_KEY", GROQ_KEY)) if not v]
-    if missing:
-        sys.exit(f"متغیر محیطی تنظیم نشده: {', '.join(missing)}")
+    if not BOT_TOKEN:
+        sys.exit("متغیر محیطی تنظیم نشده: TELEGRAM_TOKEN")
+    if not (TT_API_KEY or GROQ_KEY):
+        sys.exit("حداقل یکی از TT_API_KEY یا GROQ_API_KEY لازم است.")
     BOT_USERNAME = (api("getMe", timeout=20) or {}).get("username", "")
-    log(f"ربات @{BOT_USERNAME} روشن شد. مدل: {GROQ_MODEL} | ادمین: {ADMIN_ID}")
+    eng = engine()
+    log(f"ربات @{BOT_USERNAME} روشن شد. سرویس: {eng['label']} | مدل: {eng['model']} | ادمین: {ADMIN_ID}")
     if RUN_MAX_MINUTES:
         log(f"حالت GitHub Actions: هر چرخه {RUN_MAX_MINUTES:.0f} دقیقه و بعد ری‌استارت زنجیره‌ای.")
     try:

@@ -5,7 +5,8 @@
 --------------------------------------------------------
 مراحل کار:
   ۱) متن هر صفحه با PyMuPDF استخراج می‌شود (بلوک‌ها + موقعیت + اندازه + بولد/ایتالیک + رنگ)
-  ۲) متن هر صفحه (بلوک‌به‌بلوک) به وب‌سرویس Groq داده می‌شود و ترجمهٔ وفادار گرفته می‌شود
+  ۲) متن هر صفحه (بلوک‌به‌بلوک) به سرویس ترجمه سازگار OpenAI (Groq یا Top Tools AI)
+     داده می‌شود و ترجمهٔ وفادار گرفته می‌شود — حالت موازی با چند ورکر هم پشتیبانی می‌شود.
   ۳) متن اصلیِ صفحه حذف (redact) می‌شود و ترجمهٔ فارسی دقیقاً در همان کادرها
      با همان اندازه/بولد/رنگ و چینش راست‌به‌چپ درج می‌شود.
 
@@ -19,7 +20,9 @@ import html as html_mod
 import json
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pymupdf
@@ -29,8 +32,25 @@ import requests
 # تنظیمات سرویس و مدل
 # --------------------------------------------------------------------------
 
+# ─── سرویس‌های سازگار با OpenAI (drop-in) ───
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
+TTAI_API_URL = "https://top-tools-ai.com/api/v1/chat/completions"
+
+# مدل‌های سرویس Top Tools AI (سازگار با OpenAI):
+#   • Top-Tools-Ai: ۱۰ میلیون توکن در روز، رایگان روزانه (بدون اشتراک)
+#   • بقیه: ۱۰ میلیون توکن خوش‌آمدگویی حساب جدید یا اشتراک پولی
+#   سقف‌ها: ~۴۵ درخواست/دقیقه و حداکثر ۵ درخواست همزمان (۶مین → 429)
+#   → ترجمهٔ موازی با حداکثر ۴ ورکر + فاصله‌گذار شروع درخواست‌ها امن است.
+TTAI_MODELS = [
+    "Top-Tools-Ai",          # سهمیهٔ روزانهٔ رایگان ۱۰M توکن — پیش‌فرض
+    "GLM-5.3-Flash",
+    "DeepSeek-V4-Flash",
+    "DeepSeek-V4.1-Flash",
+    "MiMo-V2.5",
+    "MiniMax-M3",
+    "GLM-5.3",
+    "Kimi-K2.6",
+]
 
 # مدل‌های رایگانِ مناسب Groq (فهرست قابل تغییر است؛ در رابط گرافیکی قابل ویرایش است)
 #
@@ -50,9 +70,13 @@ FREE_MODELS = [
 ]
 DEFAULT_MODEL = FREE_MODELS[0]
 
-# مکث پیش‌فرض بین درخواست‌ها (ثانیه). با سقف ~۸۰۰۰ توکن در دقیقهٔ تیر فری،
-# مقدار کم باعث رگبار 429 می‌شود؛ ۱۵ ثانیه برای بچ‌های ~۶هزار کاراکتری امن است.
+# مکث پیش‌فرض بین صفحات در حالت پشت‌سرهم (Groq با سقف ~۸هزار توکن در دقیقه).
+# در حالت موازی (Top Tools AI) مکث معنی‌دار نیست؛ فاصله‌گذار نرخ (spacing) اعمال می‌شود.
 DEFAULT_DELAY = 15.0
+
+# فاصلهٔ پیش‌فرض شروع درخواست‌ها در حالت موازی (ثانیه) ≈ ۴۳ درخواست در دقیقه
+# زیر سقف ۴۵RPM سرویس‌ها؛ ۴29ها هم خودکار طبق retry-after مدیریت می‌شوند.
+DEFAULT_SPACING = 1.4
 
 # کمترین مقیاس مجاز برای کوچک‌شدن متن یک بلوک (زیر این حد، اندازه دیگر خوانا نیست)
 MIN_BLOCK_SCALE = 0.55
@@ -245,7 +269,7 @@ def extract_blocks(page: "pymupdf.Page") -> list[dict]:
 
 
 # --------------------------------------------------------------------------
-# فراخوانی وب‌سرویس Groq
+# فراخوانی وب‌سرویس ترجمه (سازگار OpenAI)
 # --------------------------------------------------------------------------
 
 
@@ -264,12 +288,40 @@ def _batch_items(items: list[tuple[int, str]], max_chars: int = 6000) -> list[li
     return batches
 
 
+class _RateLimiter:
+    """حداقل فاصلهٔ زمانی بین شروع درخواست‌ها؛ بین همهٔ ورکرها مشترک است
+    تا سقف RPM سرویس با هر تعداد ترجمهٔ موازی رعایت شود."""
+
+    def __init__(self, min_interval: float) -> None:
+        self.min_interval = max(float(min_interval), 0.0)
+        self._lock = threading.Lock()
+        self._next_t = 0.0
+
+    def wait(self) -> None:
+        if self.min_interval <= 0:
+            return
+        with self._lock:
+            now = time.time()
+            t = max(now, self._next_t)
+            self._next_t = t + self.min_interval
+        d = t - now
+        if d > 0:
+            time.sleep(d)
+
+
 def groq_translate_segments(api_key: str, model: str, segments: list[str], *,
-                            temperature: float = 0.0, timeout: int = 180,
-                            max_retries: int = 5, log=print) -> list[str]:
-    """ترجمهٔ یک دسته متن با Groq (JSON mode)؛ خروجی هم‌طول segments است."""
+                            temperature: float = 0.0, timeout: int = 240,
+                            max_retries: int = 5, log=print,
+                            base_url: str = "",
+                            usage_acc: dict | None = None,
+                            usage_lock: threading.Lock | None = None) -> list[str]:
+    """ترجمهٔ یک دسته متن با هر سرویس سازگار OpenAI (JSON mode)؛
+    خروجی هم‌طول segments است. اگر usage_acc داده شود، مصرف توکن هر پاسخ موفق
+    (prompt/completion/total و تعداد درخواست) در آن جمع زده می‌شود —
+    برای انحصار بین ورکرها usage_lock را هم بدهید."""
     if not segments:
         return []
+    url = base_url or GROQ_API_URL
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": model,
@@ -285,34 +337,56 @@ def groq_translate_segments(api_key: str, model: str, segments: list[str], *,
     last_err: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=timeout)
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if resp.status_code == 429:
                 wait = resp.headers.get("retry-after")
                 wait = float(wait) if wait else min(2 * attempt, 15)
                 log(f"محدودیت نرخ سرویس؛ {wait:.0f} ثانیه صبر می‌کنیم…")
                 time.sleep(wait)
                 continue
+            if resp.status_code == 400 and "response_format" in (resp.text or ""):
+                # سرویس JSON mode را پشتیبانی نمی‌کند؛ بدون آن ادامه می‌دهیم
+                payload.pop("response_format", None)
+                continue
             if resp.status_code == 401:
                 raise FatalTranslationError("کلید API نامعتبر است (کد 401).")
             if resp.status_code == 403:
                 raise FatalTranslationError(
-                    "دسترسی مسدود شد (کد 403). اگر از محدودیت جغرافیایی سرویس استفاده می‌کنید، "
-                    "IP خود را تغییر دهید؛ در غیر این صورت کلید را بررسی کنید.")
+                    "دسترسی مسدود شد (کد 403). اگر مدل نیازمند اشتراک است، آن را در پنل سرویس فعال کنید؛ "
+                    "کلید را بررسی کنید و در صورت محدودیت جغرافیایی IP را عوض کنید.")
             if resp.status_code == 404:
                 raise FatalTranslationError(
                     f"مدل '{model}' پیدا نشد (کد 404). نام مدل را در تنظیمات اصلاح کنید.")
-            if resp.status_code >= 500:
-                raise TranslationError(f"خطای سرور (کد {resp.status_code})")
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
+            if resp.status_code >= 400:
+                # خطای شناخته‌نشده (گاهی گیت‌وی سرویس خطاهای گذرای 400/5xx می‌دهد)
+                # → با بدنهٔ خطا در پیام، قابل تلاش مجدد در نظر گرفته می‌شود.
+                body = (resp.text or "").strip()
+                if "model_not_found" in body or "does not exist" in body:
+                    raise FatalTranslationError(
+                        f"مدل '{model}' روی این سرویس پیدا نشد (کد {resp.status_code}). "
+                        "نام مدل را در تنظیمات اصلاح کنید.")
+                raise TranslationError(f"کد {resp.status_code}: {body[:180]}")
+            data = resp.json()
+            u = data.get("usage") or {}
+            if u and usage_acc is not None:
+                if usage_lock is not None:
+                    usage_lock.acquire()
+                try:
+                    for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        usage_acc[k] = usage_acc.get(k, 0) + int(u.get(k, 0) or 0)
+                    usage_acc["api_calls"] = usage_acc.get("api_calls", 0) + 1
+                finally:
+                    if usage_lock is not None:
+                        usage_lock.release()
+            content = data["choices"][0]["message"]["content"]
             try:
-                data = json.loads(content)
+                parsed = json.loads(content)
             except json.JSONDecodeError:
                 m = re.search(r"\{.*\}", content, re.S)
                 if not m:
                     raise TranslationError("پاسخ مدل JSON نبود.") from None
-                data = json.loads(m.group(0))
-            trans = data.get("translations") if isinstance(data, dict) else None
+                parsed = json.loads(m.group(0))
+            trans = parsed.get("translations") if isinstance(parsed, dict) else None
             if not isinstance(trans, list):
                 raise TranslationError("پاسخ مدل فهرست 'translations' نداشت.")
             if len(trans) != len(segments):
@@ -326,16 +400,17 @@ def groq_translate_segments(api_key: str, model: str, segments: list[str], *,
             raise
         except (requests.RequestException, TranslationError, KeyError, IndexError) as e:
             last_err = e
-            wait = min(2 * attempt, 10)
+            # بازهٔ بلندتر بین تلاش‌ها (۴ تا ۲۰ ثانیه) تا از موج‌های گذرای خطای سرویس رد شویم
+            wait = min(4 * attempt, 20)
             log(f"تلاش {attempt}/{max_retries} ناموفق بود ({e})؛ {wait} ثانیه صبر…")
             time.sleep(wait)
     raise TranslationError(f"ترجمهٔ این بخش پس از چند تلاش ناموفق ماند: {last_err}")
 
 
-def selftest(api_key: str, model: str, log=print) -> list[str]:
+def selftest(api_key: str, model: str, log=print, base_url: str = "") -> list[str]:
     """تست سریع اتصال/کلید/مدل با دو جملهٔ کوتاه."""
     segs = ["Hello world.", "The sun rises in the east, and the moon watches quietly."]
-    outs = groq_translate_segments(api_key, model, segs, log=log)
+    outs = groq_translate_segments(api_key, model, segs, log=log, base_url=base_url)
     for s, o in zip(segs, outs):
         log(f"EN : {s}")
         log(f"FA : {o}")
@@ -473,14 +548,20 @@ def _fit_rect(b: dict, rect: "pymupdf.Rect", page_rect: "pymupdf.Rect") -> "pymu
 
 def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=None,
                   progress=None, cancelled=None, log=print, translator=None,
-                  mirror=True) -> dict:
+                  mirror=True, base_url="", workers=1, spacing=DEFAULT_SPACING) -> dict:
     """
     ترجمهٔ کامل فایل PDF انگلیسی به فارسی با حفظ چیدمان.
 
     mirror: آینه‌سازی افقی چیدمان (تیتر/پاراگراف چپ‌چین انگلیسی به سمت راست صفحه می‌رود
     و ستون‌ها جابه‌جا می‌شوند) — برای متقارن‌سازی راست‌به‌چپ.
-    translator: در حالت عادی None است (ترجمه با Groq). برای تست، تابعی
+    base_url: نشانی chat/completions سرویس سازگار OpenAI (پیش‌فرض Groq؛
+    برای Top Tools AI مقدار TTAI_API_URL را بدهید).
+    workers: تعداد ترجمه‌های موازی. ۱ = پشت‌سرهم با مکث delay بین صفحات (مناسب Groq
+    با سقف TPM)؛ ≥۲ = بچ‌های صفحات مختلف به‌موازات هم ترجمه می‌شوند (مناسب
+    Top Tools AI با سقف RPM/همزمانی) و spacing حداقل فاصلهٔ شروع درخواست‌هاست.
+    translator: در حالت عادی None است (ترجمه با وب‌سرویس). برای تست، تابعی
     (segments -> translations) می‌پذیرد تا بدون اینترنت هم پایپ‌لاین آزمایش شود.
+    خروجی: دیکشنری آمار شامل usage (مصرف توکن ورودی/خروجی/مجموع و تعداد درخواست‌ها).
     """
     progress = progress or (lambda done, total: None)
     if delay is None:
@@ -500,113 +581,161 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
     log(f"فایل «{in_path.name}» با {total} صفحه باز شد. مدل: {model}")
     arch, css = _build_css()
 
+    usage: dict = {}
+    usage_lock = threading.Lock()
+    limiter = _RateLimiter(spacing if workers > 1 else 0.0)
     stats = {"pages": total, "translated": 0, "no_text_pages": 0,
-             "failed_pages": [], "output": str(out_path), "cancelled": False}
+             "failed_pages": [], "output": str(out_path), "cancelled": False,
+             "usage": usage}
 
-    for pno in range(total):
-        if cancelled is not None and cancelled.is_set():
-            stats["cancelled"] = True
-            log("لغو شد؛ پیشرفت فعلی ذخیره می‌شود…")
-            break
+    _PURE_NUM_RE = re.compile(r"^[\d\s.,;:\-–—/()%#]+$")
 
-        page = doc[pno]
-        blocks = extract_blocks(page)
-        if not blocks:
-            stats["no_text_pages"] += 1
-            log(f"صفحهٔ {pno + 1}: متن قابل استخراج نداشت (تصویری است؟) — بدون تغییر کپی شد.")
-            progress(pno + 1, total)
-            continue
-        # جلوگیری از «متن روی متن»: بلوک‌های همپوشان ادغام می‌شوند
-        blocks = _merge_overlapping_blocks(blocks)
+    def _call_batch(batch):
+        """فراخوانی وب‌سرویس برای یک دسته؛ فاصله‌گذار نرخ بین ورکرها مشترک است."""
+        limiter.wait()
+        return groq_translate_segments(
+            api_key, model, [t for _, t in batch], log=log, base_url=base_url,
+            usage_acc=usage, usage_lock=usage_lock)
 
-        segs = [b["text"] for b in blocks]
-        trans = [""] * len(segs)
+    pool = None
+    if workers > 1 and translator is None:
+        pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="tr")
+        log(f"ترجمهٔ موازی فعال شد: {workers} ورکر، فاصلهٔ شروع درخواست‌ها {spacing:.1f} ثانیه.")
 
-        if translator is not None:
-            # حالت تست: ترجمهٔ ساختگی
-            got = [str(t) for t in translator(segs)]
-            trans = got + segs[len(got):]
-        else:
+    # (pno, blocks, segs, trans, tasks) — tasks: [(batch, Future|None), ...]
+    page_jobs: list[tuple[int, list, list, list, list]] = []
+
+    try:
+        # ── فاز ۱: استخراج صفحات و صف‌کردن بچ‌های ترجمه؛ ترجمهٔ صفحات بعدی
+        #    در پس‌زمینه به‌موازات بازسازی صفحات قبلی پیش می‌رود
+        for pno in range(total):
+            if cancelled is not None and cancelled.is_set():
+                stats["cancelled"] = True
+                log("لغو شد؛ پیشرفت فعلی ذخیره می‌شود…")
+                break
+
+            page = doc[pno]
+            blocks = extract_blocks(page)
+            if not blocks:
+                stats["no_text_pages"] += 1
+                log(f"صفحهٔ {pno + 1}: متن قابل استخراج نداشت (تصویری است؟) — بدون تغییر کپی شد.")
+                page_jobs.append((pno, [], [], [], []))
+                continue
+            # جلوگیری از «متن روی متن»: بلوک‌های همپوشان ادغام می‌شوند
+            blocks = _merge_overlapping_blocks(blocks)
+
+            segs = [b["text"] for b in blocks]
+            trans = [""] * len(segs)
+
+            if translator is not None:
+                # حالت تست: ترجمهٔ ساختگی
+                got = [str(t) for t in translator(segs)]
+                trans = got + segs[len(got):]
+                page_jobs.append((pno, blocks, segs, trans, []))
+                continue
+
             # اعداد و علائم خالص (مثل شمارهٔ صفحه) نیازی به ترجمه ندارند
-            _PURE_NUM_RE = re.compile(r"^[\d\s.,;:\-–—/()%#]+$")
             items = [(i, s) for i, s in enumerate(segs)
                      if s.strip() and not _PURE_NUM_RE.match(s.strip())]
             for idx, s in enumerate(segs):
                 if _PURE_NUM_RE.match(s.strip() or "x0x"):
                     trans[idx] = s
+
+            tasks = []
             for batch in _batch_items(items):
+                if pool is not None:
+                    tasks.append((batch, pool.submit(_call_batch, batch)))
+                else:
+                    tasks.append((batch, None))
+            page_jobs.append((pno, blocks, segs, trans, tasks))
+
+        # ── فاز ۲: بازسازی صفحات به ترتیب؛ نتیجهٔ هر بچ گرفته و درج می‌شود
+        for pno, blocks, segs, trans, tasks in page_jobs:
+            if cancelled is not None and cancelled.is_set():
+                stats["cancelled"] = True
+                log("لغو شد؛ پیشرفت فعلی ذخیره می‌شود…")
+                break
+
+            if not blocks:
+                progress(pno + 1, total)
+                continue
+
+            page = doc[pno]
+            for batch, fut in tasks:
                 try:
-                    outs = groq_translate_segments(
-                        api_key, model, [t for _, t in batch], log=log)
-                    for (idx, _), tr in zip(batch, outs):
-                        trans[idx] = tr
+                    outs = fut.result() if fut is not None else _call_batch(batch)
                 except FatalTranslationError:
-                    doc.close()
                     raise
                 except TranslationError as e:
                     stats["failed_pages"].append(pno + 1)
                     log(f"صفحهٔ {pno + 1}: {e} — متن اصلیِ این بخش حفظ شد.")
-                    for idx, _ in batch:
-                        trans[idx] = segs[idx]
+                    outs = None
+                if outs is not None:
+                    for (idx, _), tr in zip(batch, outs):
+                        trans[idx] = tr
 
-        # ۱) حذف متن اصلی صفحه
-        for b in blocks:
-            for r in b["line_rects"]:
-                pr = pymupdf.Rect(r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 0.5)
-                page.add_redact_annot(pr, fill=False)
-        _apply_redactions(page)
+            # ۱) حذف متن اصلی صفحه
+            for b in blocks:
+                for r in b["line_rects"]:
+                    pr = pymupdf.Rect(r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 0.5)
+                    page.add_redact_annot(pr, fill=False)
+            _apply_redactions(page)
 
-        # ۲) کادرهای هدف: با آینه‌سازی افقی، متن چپ‌چین انگلیسی به موقعیت متقارنِ راست می‌رود
-        page_w = page.rect.width
-        rects = []
-        for b in blocks:
-            r = b["bbox"]
-            if mirror:
-                r = pymupdf.Rect(page_w - r.x1, r.y0, page_w - r.x0, r.y1)
-            rects.append(r)
+            # ۲) کادرهای هدف: با آینه‌سازی افقی، متن چپ‌چین انگلیسی به موقعیت متقارنِ راست می‌رود
+            page_w = page.rect.width
+            rects = []
+            for b in blocks:
+                r = b["bbox"]
+                if mirror:
+                    r = pymupdf.Rect(page_w - r.x1, r.y0, page_w - r.x0, r.y1)
+                rects.append(r)
 
-        # ۳) مقیاس یکنواخت صفحه: کمترین مقیاسی که همهٔ پاراگراف‌ها جا شوند؛
-        #    همهٔ بلوک‌ها با همان ضریب کوچک می‌شوند تا اندازه‌ها یکنواخت بماند
-        scales = {}
-        for i, (b, t) in enumerate(zip(blocks, trans)):
-            if (t or "").strip():
-                scales[i] = _measure_scale(t, b, rects[i], css, arch)
-        para_scales = [scales[i] for i, b in enumerate(blocks)
-                       if i in scales and len(b["line_rects"]) > 1]
-        page_scale = max(min(para_scales), 0.7) if para_scales else 1.0
-        page_scale = min(page_scale, 1.0)
+            # ۳) مقیاس یکنواخت صفحه: کمترین مقیاسی که همهٔ پاراگراف‌ها جا شوند؛
+            #    همهٔ بلوک‌ها با همان ضریب کوچک می‌شوند تا اندازه‌ها یکنواخت بماند
+            scales = {}
+            for i, (b, t) in enumerate(zip(blocks, trans)):
+                if (t or "").strip():
+                    scales[i] = _measure_scale(t, b, rects[i], css, arch)
+            para_scales = [scales[i] for i, b in enumerate(blocks)
+                           if i in scales and len(b["line_rects"]) > 1]
+            page_scale = max(min(para_scales), 0.7) if para_scales else 1.0
+            page_scale = min(page_scale, 1.0)
 
-        # ۴) درج ترجمهٔ فارسی
-        for i, (b, t) in enumerate(zip(blocks, trans)):
-            t = (t or "").strip()
-            if not t:
-                continue
-            s_own = scales.get(i, 1.0)
-            use = page_scale if s_own >= page_scale else s_own
-            if s_own < page_scale:
-                log(f"صفحهٔ {pno + 1}: یک بلوک با مقیاس {int(s_own * 100)}٪ درج شد "
-                    f"(در مقیاس یکنواختِ {int(page_scale * 100)}٪ جا نشد).")
-            rect = _fit_rect(b, rects[i], page.rect)
-            if rect.is_empty or rect.width <= 2 or rect.height <= 2:
-                continue
-            try:
-                _spare, shrink = page.insert_htmlbox(
-                    rect, _block_html(t, b, use), css=css, archive=arch)
-                if shrink and shrink < 0.85:
-                    log(f"صفحهٔ {pno + 1}: یک بلوک برای جا شدن به {int(shrink * 100)}٪ کوچک شد.")
-            except Exception as e:  # noqa: BLE001
-                log(f"صفحهٔ {pno + 1}: درج متن ناموفق بود: {e}")
+            # ۴) درج ترجمهٔ فارسی
+            for i, (b, t) in enumerate(zip(blocks, trans)):
+                t = (t or "").strip()
+                if not t:
+                    continue
+                s_own = scales.get(i, 1.0)
+                use = page_scale if s_own >= page_scale else s_own
+                if s_own < page_scale:
+                    log(f"صفحهٔ {pno + 1}: یک بلوک با مقیاس {int(s_own * 100)}٪ درج شد "
+                        f"(در مقیاس یکنواختِ {int(page_scale * 100)}٪ جا نشد).")
+                rect = _fit_rect(b, rects[i], page.rect)
+                if rect.is_empty or rect.width <= 2 or rect.height <= 2:
+                    continue
+                try:
+                    _spare, shrink = page.insert_htmlbox(
+                        rect, _block_html(t, b, use), css=css, archive=arch)
+                    if shrink and shrink < 0.85:
+                        log(f"صفحهٔ {pno + 1}: یک بلوک برای جا شدن به {int(shrink * 100)}٪ کوچک شد.")
+                except Exception as e:  # noqa: BLE001
+                    log(f"صفحهٔ {pno + 1}: درج متن ناموفق بود: {e}")
 
-        stats["translated"] += 1
-        progress(pno + 1, total)
+            stats["translated"] += 1
+            progress(pno + 1, total)
 
-        # ذخیرهٔ موقت هر ۲۵ صفحه (برای جلوگیری از از دست رفتن پیشرفت)
-        if (pno + 1) % 25 == 0 and pno + 1 < total:
-            doc.save(str(tmp_path), garbage=3, deflate=True)
-            log(f"ذخیرهٔ موقت انجام شد ({pno + 1} از {total}).")
+            # ذخیرهٔ موقت هر ۲۵ صفحه (برای جلوگیری از از دست رفتن پیشرفت)
+            if (pno + 1) % 25 == 0 and pno + 1 < total:
+                doc.save(str(tmp_path), garbage=3, deflate=True)
+                log(f"ذخیرهٔ موقت انجام شد ({pno + 1} از {total}).")
 
-        if delay and pno + 1 < total and translator is None:
-            time.sleep(delay)
+            if pool is None and delay and pno + 1 < total:
+                time.sleep(delay)
+    finally:
+        # بستن استخر: کارهای در صف لغو می‌شوند؛ حداکثر «workers» درخواستِ در جریان تمام می‌شود
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     if stats["cancelled"]:
         doc.save(str(tmp_path), garbage=3, deflate=True)
@@ -620,6 +749,10 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
     dt = time.time() - t0
     log(f"پایان: {stats['translated']} از {total} صفحه در {dt:.0f} ثانیه پردازش شد. "
         f"خروجی: {stats['output']}")
+    if usage:
+        log(f"مصرف توکن: ورودی {usage.get('prompt_tokens', 0):,} | "
+            f"خروجی {usage.get('completion_tokens', 0):,} | "
+            f"مجموع {usage.get('total_tokens', 0):,} در {usage.get('api_calls', 0)} درخواست")
     return stats
 
 
@@ -635,7 +768,9 @@ if __name__ == "__main__":
     ap.add_argument("-o", "--output", help="مسیر خروجی (پیش‌فرض: نام فایل + fa.")
     ap.add_argument("-k", "--api-key", help="کلید API گروق (در نبود آن از config.json خوانده می‌شود)")
     ap.add_argument("-m", "--model", default=DEFAULT_MODEL, help="نام مدل")
-    ap.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="مکث بین صفحات به ثانیه")
+    ap.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="مکث بین صفحات به ثانیه (حالت پشت‌سرهم)")
+    ap.add_argument("--base-url", default="", help="نشانی سرویس سازگار OpenAI (پیش‌فرض Groq)")
+    ap.add_argument("--workers", type=int, default=1, help="تعداد ترجمه‌های موازی (۱ = پشت‌سرهم)")
     ap.add_argument("--no-mirror", action="store_true",
                     help="غیرفعال‌کردن آینه‌سازی افقی چیدمان")
     a = ap.parse_args()
@@ -654,6 +789,7 @@ if __name__ == "__main__":
 
     _out = a.output or str(Path(a.input).with_name(Path(a.input).stem + "_fa.pdf"))
     translate_pdf(a.input, _out, _key, model=a.model, delay=a.delay, mirror=not a.no_mirror,
+                  base_url=a.base_url, workers=max(1, a.workers),
                   progress=lambda d, t: print(f"صفحه {d}/{t}", end="\r", flush=True),
                   log=print)
     print()

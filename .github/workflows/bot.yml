@@ -61,6 +61,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TT_API_KEY: ${{ secrets.TT_API_KEY }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPO: ${{ github.repository }}
