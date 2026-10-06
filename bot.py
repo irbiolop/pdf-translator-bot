@@ -72,18 +72,18 @@ PROVIDERS = {
 }
 
 
-def engine() -> dict:
-    """سرویس و مدل فعال فعلی (از تنظیمات ادمین خوانده می‌شود)."""
+def engine(prov: str | None = None) -> dict:
+    """سرویس فعال فعلی (یا سرویس خواسته‌شده با prov) با مدل معتبرش (از تنظیمات ادمین)."""
     with state_lock:
-        prov = state["config"].get("provider", DEFAULT_PROVIDER)
+        p = prov or state["config"].get("provider", DEFAULT_PROVIDER)
         model = state["config"].get("model", DEFAULT_MODEL)
-    if prov not in PROVIDERS:
-        prov = "ttai"
-    p = PROVIDERS[prov]
-    if model not in p["models"]:
-        model = p["models"][0]
-    return {"prov": prov, "label": p["label"], "base": p["base"], "key": p["key"],
-            "parallel": p["parallel"], "models": p["models"], "model": model}
+    if p not in PROVIDERS:
+        p = "ttai"
+    info = PROVIDERS[p]
+    if model not in info["models"]:
+        model = info["models"][0]
+    return {"prov": p, "label": info["label"], "base": info["base"], "key": info["key"],
+            "parallel": info["parallel"], "models": info["models"], "model": model}
 
 TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_REPO_PATH = "data/state.json"
@@ -104,6 +104,45 @@ SPEED_ORDER = ["fast", "balanced", "safe"]
 def speed_label(speed: str) -> str:
     labels = SPEED_LABELS_TT if engine()["parallel"] else SPEED_LABELS_GROQ
     return labels.get(speed, speed)
+
+
+# پیام کوتاه فارسی برای خطاهای مرگبار — بدنهٔ خام انگلیسی سرویس به کاربر نشان داده نمی‌شود
+ERR_SHORT = {
+    "auth": "کلید سرویس ترجمه نامعتبر است",
+    "access": "دسترسی به سرویس ترجمه مسدود است",
+    "model": "مدل انتخابی روی این سرویس موجود نیست",
+    "provider": "سرویس ترجمه موقتاً قطع است (خطای بالادستیِ سرویس)",
+    "config": "خطای پیکربندی سرویس ترجمه",
+}
+
+
+def short_err(err: Exception) -> str:
+    """پیام خطای فشرده؛ جزئیات خام فقط برای کدهای ناشناخته و حداکثر ۱۴۰ نویسه."""
+    code = getattr(err, "code", "")
+    if code in ERR_SHORT:
+        return ERR_SHORT[code]
+    d = str(err).strip() or "خطای نامشخص"
+    return d if len(d) <= 140 else d[:137] + "…"
+
+
+provider_alert_ts: dict = {}  # label → آخرین زمان هشدار (throttle ۳۰ دقیقه‌ای)
+
+
+def alert_admin_provider_down(label: str, err: Exception) -> None:
+    """هشدار قطعی سرویس به ادمین — برای هر سرویس حداکثر هر ۳۰ دقیقه یک‌بار."""
+    now = time.time()
+    if now - provider_alert_ts.get(label, 0.0) < 1800:
+        return
+    provider_alert_ts[label] = now
+    if not ADMIN_ID:
+        return
+    try:
+        send(ADMIN_ID,
+             f"⚠️ <b>قطعی سرویس ترجمه: {label}</b>\n"
+             f"علت: {short_err(err)}\n"
+             "فیلورور خودکار به سرویس جایگزین فعال شد؛ برای تست همهٔ سرویس‌ها /ping بفرست.")
+    except TgError:
+        pass
 
 MAX_DOWNLOAD = 19 * 1024 * 1024   # سقف دانلود فایل در Bot API تلگرام
 MAX_QUEUE = 6                     # حداکثر فایل در صف
@@ -352,6 +391,7 @@ def stats_text() -> str:
             f"⏳ صف فعلی: {job_q.qsize()}",
             f"⚡ سرعت: {speed_label(cfg.get('speed'))}",
             f"🤖 سرویس: {PROVIDERS.get(cfg.get('provider'), PROVIDERS['ttai'])['label']} — <code>{cfg.get('model')}</code>",
+            "🔁 فیلورور خودکار: فعال (قطعی سرویس → سرویس جایگزین)",
             f"🧮 توکن مصرفی کل: {totals.get('tokens', 0):,}",
             f"⏱ آپ‌تایم: {(now - start_ts) // 60:.0f} دقیقه",
         ]
@@ -592,16 +632,15 @@ def process_job(job: dict) -> None:
 
     with state_lock:
         speed = state["config"].get("speed", "fast")
-    eng = engine()
-    if not eng["key"]:
-        edit(chat, stid, f"❌ کلید سرویس {eng['label']} تنظیم نشده است؛ به ادمین خبر بده.")
+    # زنجیرهٔ فیلورور: سرویس فعال اول؛ اگر قطع/مسدود بود (401 بالادستی، کلید،
+    # دسترسی، مدل) خودکار با سرویس بعدیِ دارای کلید ادامه می‌دهیم.
+    primary = engine()
+    chain = ([primary] if primary["key"] else []) + \
+            [engine(p) for p in PROVIDERS if p != primary["prov"] and PROVIDERS[p]["key"]]
+    if not chain:
+        edit(chat, stid, "❌ هیچ کلیدی برای سرویس‌های ترجمه تنظیم نشده است؛ به ادمین خبر بده.")
         in_pdf.unlink(missing_ok=True)
         return
-    if eng["parallel"]:
-        w, sp = SPEEDS_TT.get(speed, SPEEDS_TT["fast"])
-        upd(f"🌍 شروع ترجمهٔ موازی <b>{n_pages}</b> صفحه با <code>{eng['model']}</code> ({w} ورکر)…", force=True)
-    else:
-        upd(f"🌍 شروع ترجمهٔ <b>{n_pages}</b> صفحه با <code>{eng['model']}</code>…", force=True)
     t0 = time.time()
 
     def progress(done: int, total: int) -> None:
@@ -609,34 +648,66 @@ def process_job(job: dict) -> None:
         bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
         upd(f"🔄 ترجمه: {bar} {done}/{total} صفحه ({pct}٪)")
 
-    try:
+    res = None
+    last_fatal: Exception | None = None
+    for attempt, eng in enumerate(chain):
         if eng["parallel"]:
-            res = core.translate_pdf(str(in_pdf), str(out_pdf), eng["key"], model=eng["model"],
-                                     base_url=eng["base"], workers=w, spacing=sp,
-                                     progress=progress, cancelled=None,
-                                     log=lambda *a: None, mirror=True)
+            w, sp = SPEEDS_TT.get(speed, SPEEDS_TT["fast"])
+            start_msg = (f"🌍 شروع ترجمهٔ موازی <b>{n_pages}</b> صفحه با "
+                         f"<code>{eng['model']}</code> ({w} ورکر)…")
         else:
-            res = core.translate_pdf(str(in_pdf), str(out_pdf), eng["key"], model=eng["model"],
-                                     base_url=eng["base"], delay=SPEEDS_GROQ.get(speed, 15.0),
-                                     progress=progress, cancelled=None,
-                                     log=lambda *a: None, mirror=True)
-    except core.FatalTranslationError as err:
-        edit(chat, stid, f"❌ خطای پیکربندی ترجمه: <code>{err}</code>\n"
-                         "این مشکل کلید/مدل/اشتراک است؛ به ادمین خبر بده.")
-        in_pdf.unlink(missing_ok=True)
-        return
-    except core.TranslationError as err:
-        edit(chat, stid, f"❌ ترجمه ناتمام ماند: <code>{err}</code>\n"
-                         "سرویس ترجمه شلوغ است؛ چند دقیقه بعد دوباره امتحان کن.")
+            start_msg = f"🌍 شروع ترجمهٔ <b>{n_pages}</b> صفحه با <code>{eng['model']}</code>…"
+        if attempt > 0:
+            upd(f"⚠️ سرویس <b>{chain[attempt - 1]['label']}</b> در دسترس نیست؛ "
+                + start_msg.replace("🌍 شروع", "ادامه"), force=True)
+        else:
+            upd(start_msg, force=True)
+        try:
+            if eng["parallel"]:
+                res = core.translate_pdf(str(in_pdf), str(out_pdf), eng["key"], model=eng["model"],
+                                         base_url=eng["base"], workers=w, spacing=sp,
+                                         progress=progress, cancelled=None,
+                                         log=lambda *a: None, mirror=True)
+            else:
+                res = core.translate_pdf(str(in_pdf), str(out_pdf), eng["key"], model=eng["model"],
+                                         base_url=eng["base"], delay=SPEEDS_GROQ.get(speed, 15.0),
+                                         progress=progress, cancelled=None,
+                                         log=lambda *a: None, mirror=True)
+            break
+        except core.FatalTranslationError as err:
+            last_fatal = err
+            log(f"سرویس {eng['label']} شکست خورد (کد {getattr(err, 'code', 'config')}): {err}")
+            alert_admin_provider_down(eng["label"], err)
+            continue
+        except core.TranslationError as err:
+            edit(chat, stid, f"❌ ترجمه ناتمام ماند: {short_err(err)}\n"
+                             "سرویس ترجمه شلوغ است؛ چند دقیقه بعد دوباره امتحان کن.")
+            in_pdf.unlink(missing_ok=True)
+            return
+    if res is None:
+        edit(chat, stid, "❌ ترجمه انجام نشد: "
+             + (short_err(last_fatal) if last_fatal else "هیچ سرویس ترجمه‌ای پاسخگو نبود")
+             + "\nبه ادمین خبر بده.")
         in_pdf.unlink(missing_ok=True)
         return
     usage = (res or {}).get("usage", {})
 
     secs = time.time() - t0
+    out_mb = out_pdf.stat().st_size / (1024 * 1024)
     upd("📤 در حال ارسال فایل ترجمه‌شده…", force=True)
+    if out_mb > 49.5:
+        edit(chat, stid, f"❌ فایل خروجی ({out_mb:.0f} مگابایت) از سقف ۵۰ مگابایتی تلگرام بزرگ‌تر است؛ "
+                         "فایل کوچک‌تری بفرست.")
+        in_pdf.unlink(missing_ok=True)
+        out_pdf.unlink(missing_ok=True)
+        return
+    failed_n = len((res or {}).get("failed_pages", []))
+    cap = (f"✅ ترجمهٔ «{name}» — {n_pages} صفحه در {secs / 60:.1f} دقیقه"
+           f" | حجم: {out_mb:.1f}MB")
+    if failed_n:
+        cap += f"\n⚠️ {failed_n} صفحه به‌خاطر خطای سرویس ترجمه نشد (متن اصلی ماند)."
     try:
-        upload_document(chat, out_pdf,
-                        f"✅ ترجمهٔ «{name}» — {n_pages} صفحه در {secs / 60:.1f} دقیقه")
+        upload_document(chat, out_pdf, cap)
     except TgError as e:
         edit(chat, stid, f"❌ ارسال فایل ناموفق بود: <code>{e}</code>")
         in_pdf.unlink(missing_ok=True)
@@ -752,12 +823,19 @@ def handle_message(m: dict) -> None:
     elif text.startswith("/admin") and is_admin(uid):
         send(chat_id, "پنل ادمین ⚙️", reply_markup=admin_menu())
     elif text.startswith("/ping") and is_admin(uid):
-        eng = engine()
-        try:
-            core.selftest(eng["key"], eng["model"], log=lambda *a: None, base_url=eng["base"])
-            send(chat_id, f"✅ اتصال {eng['label']} برقرار است و مدل <code>{eng['model']}</code> پاسخ داد.")
-        except Exception as e:  # noqa: BLE001
-            send(chat_id, f"❌ خطای {eng['label']}: <code>{e}</code>")
+        lines = []
+        for pkey, pinfo in PROVIDERS.items():
+            if not pinfo["key"]:
+                lines.append(f"❌ {pinfo['label']}: کلید تنظیم نشده")
+                continue
+            eng_p = engine(pkey)
+            try:
+                core.selftest(eng_p["key"], eng_p["model"], log=lambda *a: None,
+                              base_url=eng_p["base"])
+                lines.append(f"✅ {pinfo['label']} — <code>{eng_p['model']}</code> پاسخ داد")
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"❌ {pinfo['label']} — {short_err(e)}")
+        send(chat_id, "🏓 وضعیت سرویس‌های ترجمه:\n" + "\n".join(lines))
     elif "document" in m:
         on_document(m)
     elif text:

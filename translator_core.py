@@ -122,7 +122,19 @@ class TranslationError(Exception):
 
 
 class FatalTranslationError(TranslationError):
-    """خطای غیرقابل جبران (مثل کلید نامعتبر) — تلاش مجدد بی‌فایده است."""
+    """خطای غیرقابل جبران (مثل کلید نامعتبر) — تلاش مجدد بی‌فایده است.
+
+    code برای تصمیم فیلورورِ ربات است:
+      • auth     — کلید API نامعتبر
+      • access   — دسترسی مسدود (اشتراک/آی‌پی)
+      • model    — مدل پیدا نشد
+      • provider — قطعی بالادستیِ خود سرویس (مثل provider_http_401 گیت‌وی)
+      • config   — سایر موارد
+    """
+
+    def __init__(self, msg: str, code: str = "config"):
+        super().__init__(msg)
+        self.code = code
 
 
 # --------------------------------------------------------------------------
@@ -348,23 +360,39 @@ def groq_translate_segments(api_key: str, model: str, segments: list[str], *,
                 # سرویس JSON mode را پشتیبانی نمی‌کند؛ بدون آن ادامه می‌دهیم
                 payload.pop("response_format", None)
                 continue
+            body = (resp.text or "").strip()
             if resp.status_code == 401:
-                raise FatalTranslationError("کلید API نامعتبر است (کد 401).")
+                # گیت‌وی سرویس (مثل Top Tools AI) وقتی کلیدِ ما سالم است ولی
+                # تأمین‌کنندهٔ بالادستی‌اش رد می‌کند، همان 401 را با بدنهٔ
+                # provider_http_401 برمی‌گرداند — این قطعیِ سرویس است نه مشکل کلید.
+                if "provider_http" in body:
+                    raise FatalTranslationError(
+                        "سرویس ترجمه موقتاً قطع است (تأمین‌کنندهٔ بالادستی درخواست را رد کرد).",
+                        code="provider")
+                raise FatalTranslationError("کلید API نامعتبر است (کد 401).", code="auth")
             if resp.status_code == 403:
+                if "provider_http" in body:
+                    raise FatalTranslationError(
+                        "سرویس ترجمه موقتاً قطع است (تأمین‌کنندهٔ بالادستی دسترسی را مسدود کرد).",
+                        code="provider")
                 raise FatalTranslationError(
                     "دسترسی مسدود شد (کد 403). اگر مدل نیازمند اشتراک است، آن را در پنل سرویس فعال کنید؛ "
-                    "کلید را بررسی کنید و در صورت محدودیت جغرافیایی IP را عوض کنید.")
+                    "کلید را بررسی کنید و در صورت محدودیت جغرافیایی IP را عوض کنید.", code="access")
             if resp.status_code == 404:
                 raise FatalTranslationError(
-                    f"مدل '{model}' پیدا نشد (کد 404). نام مدل را در تنظیمات اصلاح کنید.")
+                    f"مدل '{model}' پیدا نشد (کد 404). نام مدل را در تنظیمات اصلاح کنید.",
+                    code="model")
             if resp.status_code >= 400:
                 # خطای شناخته‌نشده (گاهی گیت‌وی سرویس خطاهای گذرای 400/5xx می‌دهد)
                 # → با بدنهٔ خطا در پیام، قابل تلاش مجدد در نظر گرفته می‌شود.
-                body = (resp.text or "").strip()
+                if "provider_http_401" in body:
+                    raise FatalTranslationError(
+                        "سرویس ترجمه موقتاً قطع است (تأمین‌کنندهٔ بالادستی درخواست را رد کرد).",
+                        code="provider")
                 if "model_not_found" in body or "does not exist" in body:
                     raise FatalTranslationError(
                         f"مدل '{model}' روی این سرویس پیدا نشد (کد {resp.status_code}). "
-                        "نام مدل را در تنظیمات اصلاح کنید.")
+                        "نام مدل را در تنظیمات اصلاح کنید.", code="model")
                 raise TranslationError(f"کد {resp.status_code}: {body[:180]}")
             data = resp.json()
             u = data.get("usage") or {}
@@ -529,6 +557,29 @@ def _apply_redactions(page: "pymupdf.Page") -> None:
                               graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
     except (TypeError, AttributeError):  # سازگاری با نسخه‌های قدیمی‌تر
         page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE)
+
+
+def _finalize_save(doc, out_path, log=print) -> None:
+    """ذخیرهٔ نهایی با فشرده‌سازی کامل برای کاهش حجم فایل خروجی:
+
+      ۱) subset_fonts — فقط نویسه‌های استفاده‌شده از فونت فارسی نگه داشته می‌شود
+         (فونت کامل وزیرمتن صدها کیلوبایت است؛ زیرمجموعه چند ده کیلوبایت)
+      ۲) rewrite_images — تصاویر پرچگالی (اسکن‌ها) با DPI پایین‌تر و JPEG کیفیت ۷۰
+         بازفشرده می‌شوند (فقط یک‌بار، در پایان — تکرار کیفیت را خراب می‌کند)
+      ۳) save با garbage=4/clean — اشیای بلااستفاده و نسخه‌های تکراری حذف می‌شوند
+    """
+    try:
+        doc.subset_fonts()
+        log("فشرده‌سازی فونت‌ها انجام شد.")
+    except Exception as e:  # noqa: BLE001
+        log(f"فشرده‌سازی فونت ناموفق بود: {e}")
+    try:
+        doc.rewrite_images(dpi_threshold=150, dpi_target=120, quality=70)
+        log("بازفشرده‌سازی تصاویر انجام شد.")
+    except Exception as e:  # noqa: BLE001
+        log(f"بازفشرده‌سازی تصاویر ناموفق بود: {e}")
+    doc.save(str(out_path), garbage=4, deflate=True, deflate_images=True,
+             deflate_fonts=True, clean=True)
 
 
 def _fit_rect(b: dict, rect: "pymupdf.Rect", page_rect: "pymupdf.Rect") -> "pymupdf.Rect":
@@ -737,11 +788,17 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
 
+    # اگر سرویس هیچ صفحه‌ای را ترجمه نکرد (موج قطعی 5xx/قطعیِ کامل)، به‌جای
+    # تحویل فایلِ دست‌نخورده با ظاهرِ موفقیت، خطای فیلورورپذیر پرتاب می‌شود.
+    if not stats["cancelled"] and stats["translated"] == 0 and stats["failed_pages"]:
+        raise FatalTranslationError(
+            "هیچ صفحه‌ای ترجمه نشد؛ سرویس ترجمه پاسخگو نبود.", code="provider")
+
     if stats["cancelled"]:
-        doc.save(str(tmp_path), garbage=3, deflate=True)
+        _finalize_save(doc, tmp_path, log)
         stats["output"] = str(tmp_path)
     else:
-        doc.save(str(out_path), garbage=3, deflate=True)
+        _finalize_save(doc, out_path, log)
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
     doc.close()
