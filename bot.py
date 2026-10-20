@@ -13,7 +13,9 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
+import collections
 import html as html_mod
 import json
 import os
@@ -347,13 +349,23 @@ def list_free_models() -> list[str]:
 # MTProto (Telethon) — دانلود/آپلود فایل‌های بزرگ‌تر از سقف Bot API
 # --------------------------------------------------------------------------
 class MTProtoClient:
-    """کلاینت Telethon همیشه‌روشن در یک ترد جدا با event loop خودش؛
-    آپدیت‌های واقعی را می‌گیرد تا access_hash کاربران/چت‌ها کش شود."""
+    """کلاینت Telethon همیشه‌روشن در یک ترد جدا با event loop خودش.
+
+    نکتهٔ مهم: ربات‌ها نمی‌توانند تاریخچهٔ چت را بخوانند (GetHistory ممنوع است)
+    ولی messages.getMessages با آیدی دقیق مجاز است. برای بی‌نیازی از کش entity
+    سه مسیر به‌ترتیب امتحان می‌شود:
+      ۱) کش مدیای زنده — آپدیت‌های دریافتی همان لحظه (بدون نیاز به هیچ رزولوشنی)
+      ۲) InputPeerUser(uid, 0) — برای گفتگوی خصوصیِ کاربر با خودِ ربات، سرور
+         access_hash صفر را می‌پذیرد (تست واقعی شد)
+      ۳) رزولوشن با آیدی خام از کش entity Telethon
+    """
 
     def __init__(self) -> None:
         self._client = None
         self._loop = None
         self.ready = threading.Event()
+        self._media: "collections.OrderedDict[tuple[int, int], object]" = collections.OrderedDict()
+        self._media_lock = threading.Condition()
 
     def start(self) -> None:
         if not (TG_API_ID and TG_API_HASH):
@@ -380,12 +392,40 @@ class MTProtoClient:
         threading.Thread(target=_runner, daemon=True, name="mtproto").start()
 
     async def _boot(self):
-        from telethon import TelegramClient
+        from telethon import TelegramClient, events
         from telethon.sessions import StringSession
         self._client = TelegramClient(StringSession(), TG_API_ID, TG_API_HASH,
                                       request_retries=3, connection_retries=5)
         await self._client.start(bot_token=BOT_TOKEN)
+
+        @self._client.on(events.NewMessage)
+        async def _cache_media(e):  # هر مدیایی که همین حالا می‌رسد کش می‌شود
+            try:
+                if e.message is not None and e.message.document:
+                    self._remember_media(e.chat_id, e.message.id, e.message)
+            except Exception:  # noqa: BLE001
+                pass
         log("MTProto متصل شد.")
+
+    def _remember_media(self, chat_id: int, mid: int, msg) -> None:
+        with self._media_lock:
+            self._media[(int(chat_id), int(mid))] = msg
+            while len(self._media) > 200:   # جلوگیری از رشد بی‌حد حافظه
+                self._media.popitem(last=False)
+            self._media_lock.notify_all()
+
+    def _take_media(self, chat_id: int, mid: int, timeout: float = 20.0):
+        """مدیای زنده را صبر می‌کند (آپدیت Telethon معمولاً هم‌زمان Bot API می‌رسد)."""
+        key = (int(chat_id), int(mid))
+        deadline = time.time() + max(timeout, 0.0)
+        with self._media_lock:
+            while True:
+                if key in self._media:
+                    return self._media[key]
+                remain = deadline - time.time()
+                if remain <= 0:
+                    return None
+                self._media_lock.wait(remain)
 
     def _call(self, coro_fn, timeout: float = 1800.0):
         if not (self.ready.is_set() and self._client and self._loop):
@@ -394,38 +434,88 @@ class MTProtoClient:
             fut = asyncio.run_coroutine_threadsafe(coro_fn(), self._loop)
             return fut.result(timeout=timeout)
         except Exception as e:  # noqa: BLE001
-            log(f"MTProto call ناموفق بود: {e}")
+            log(f"MTProto call ناموفق بود: {type(e).__name__}: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
             return None
+
+    async def _fetch_msg(self, peer, message_id: int):
+        msg = await self._client.get_messages(peer, ids=[message_id])
+        m = msg[0] if isinstance(msg, list) else msg
+        if not m or not getattr(m, "document", None):
+            return None
+        try:
+            self._remember_media(peer.user_id if hasattr(peer, "user_id") else 0,
+                                 message_id, m)
+        except Exception:  # noqa: BLE001
+            pass
+        return m
 
     def download(self, chat_id: int, message_id: int, dest: Path) -> bool:
         """دانلود مدیای یک پیام با MTProto (بدون سقف ۲۰MB Bot API)."""
         import asyncio
+        chat_id, message_id = int(chat_id), int(message_id)
+        self.last_error = ""
+        if not self.ready.is_set():
+            self.last_error = "کلاینت MTProto آماده نیست"
+            return False
 
-        async def _do():
-            msg = None
-            # گاهی کش entity هنوز کامل نیست؛ چند بار با مکث کوتاه تلاش می‌کنیم
-            for i in range(5):
-                try:
-                    msg = await self._client.get_messages(int(chat_id), ids=int(message_id))
-                    break
-                except Exception as e:  # noqa: BLE001
-                    if i == 4:
-                        raise
-                    await asyncio.sleep(2 + i * 2)
-            if not msg or not msg.document:
-                return False
-            out = await self._client.download_media(msg, file=str(dest))
+        async def _dl_cached(m) -> bool:
+            out = await self._client.download_media(m, file=str(dest))
             p = Path(str(out)) if out else dest
             return p.exists() and p.stat().st_size > 0
 
-        return bool(self._call(_do))
+        # ۱) پیام زندهٔ کش‌شده (کاملاً بدون رزولوشن)
+        m = self._take_media(chat_id, message_id, timeout=20.0)
+        if m is not None and self._call(lambda: _dl_cached(m)):
+            return True
+
+        # ۲) InputPeerUser با hash صفر — برای گفتگوی خصوصی کاربر با ربات
+        try:
+            from telethon.tl.types import InputPeerUser
+            r = self._call(lambda: self._dl_by_peer(InputPeerUser(chat_id, 0),
+                                                    message_id, dest))
+            if r:
+                return True
+        except Exception as e:  # noqa: BLE001
+            log(f"مسیر hash=0 ناموفق: {e}")
+            self.last_error = self.last_error or str(e)
+
+        # ۳) رزولوشن با کش entity Telethon
+        if self._call(lambda: self._dl_by_peer(chat_id, message_id, dest)):
+            return True
+
+        log(f"دانلود MTProto کامل شکست خورد ({chat_id}/{message_id}): "
+            f"{self.last_error or 'پیام پیدا نشد'}")
+        try:
+            if ADMIN_ID:
+                send(ADMIN_ID, f"⚠️ خطای MTProto\nگفتگو: <code>{chat_id}</code> | پیام: "
+                               f"<code>{message_id}</code>\nعلت: "
+                               f"<code>{html_mod.escape((self.last_error or 'پیام پیدا نشد')[:160])}</code>")
+        except TgError:
+            pass
+        return False
+
+    async def _dl_by_peer(self, peer, message_id: int, dest: Path) -> bool:
+        m = await self._fetch_msg(peer, message_id)
+        if m is None:
+            self.last_error = self.last_error or "پیام با این آیدی پیدا نشد"
+            return False
+        out = await self._client.download_media(m, file=str(dest))
+        p = Path(str(out)) if out else dest
+        return p.exists() and p.stat().st_size > 0
 
     def upload(self, chat_id: int, path: Path, caption: str) -> bool:
         """ارسال فایل خروجی بزرگ با MTProto (بدون سقف ۵۰MB Bot API)."""
         import asyncio
 
         async def _do():
-            await self._client.send_file(int(chat_id), str(path), caption=caption[:1024],
+            peer = None
+            try:
+                from telethon.tl.types import InputPeerUser
+                peer = InputPeerUser(int(chat_id), 0)
+            except Exception:  # noqa: BLE001
+                peer = int(chat_id)
+            await self._client.send_file(peer, str(path), caption=caption[:1024],
                                          parse_mode="html", force_document=True)
             return True
 
