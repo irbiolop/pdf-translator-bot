@@ -23,7 +23,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 340   # > زمان چرخهٔ ربات (۳۰۰ دقیقه) با حاشیهٔ نصب
+    timeout-minutes: 355   # سقف سخت GitHub هم ۳۶۰ است؛ ۵ دقیقه حاشیه برای نصب
     steps:
       - uses: actions/checkout@v4
 
@@ -75,7 +75,9 @@ jobs:
           ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPO: ${{ github.repository }}
-          RUN_MAX_MINUTES: "300"
+          RUN_MAX_MINUTES: "285"
+          JOB_HARD_MINUTES: "345"
+          MAX_PAGE_LIMIT: "2000"
 
       - name: 🔁 زنجیرهٔ ری‌استارت (ضد سقف ۶ ساعتهٔ GitHub)
         if: always() && (steps.bot.outcome == 'success' || steps.bot.outcome == 'failure')

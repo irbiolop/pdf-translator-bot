@@ -49,6 +49,8 @@ GH_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GH_REPO = os.environ.get("GITHUB_REPO", "").strip()  # owner/name
 GH_BRANCH = os.environ.get("GH_BRANCH", "main").strip() or "main"
 DEFAULT_PAGE_LIMIT = int(os.environ.get("PAGE_LIMIT", "40") or 40)
+# سقف قابل تنظیم سقف صفحه در پنل ادمین (پیش‌فرض ۲۰۰۰؛ با متغیر MAX_PAGE_LIMIT عوض می‌شود)
+MAX_PAGE_LIMIT = int(os.environ.get("MAX_PAGE_LIMIT", "2000") or 2000)
 FORCE_JOIN_ENABLED = os.environ.get("FORCE_JOIN_ENABLED", "0") == "1"
 FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "").strip()
 PORT = int(os.environ.get("PORT", "10000") or 10000)
@@ -124,6 +126,10 @@ def alert_admin_provider_down(label: str, err: Exception) -> None:
 MAX_DOWNLOAD = 19 * 1024 * 1024   # سقف دانلود مستقیم Bot API تلگرام
 MAX_MTPROTO = 1900 * 1024 * 1024  # سقف منطقی فایل با MTProto (~۲GB تلگرام)
 MAX_QUEUE = 6                     # حداکثر فایل در صف
+# تخمین زمان ترجمه برای فایل‌های خیلی بزرگ (ثانیه به‌ازای هر صفحه؛ شامل پردازش PDF).
+# اگر فایل تا سقف سخت جاب جا نشود، به‌جای کشته‌شدن وسط کار، با پیام راهنما رد می‌شود.
+SEC_PER_PAGE_EST = float(os.environ.get("SEC_PER_PAGE_EST", "7.5") or 7.5)
+JOB_HARD_MINUTES = float(os.environ.get("JOB_HARD_MINUTES", "345") or 345)  # سقف timeout-minutes ورک‌فلو منهای حاشیه
 
 state_lock = threading.RLock()
 dirty = threading.Event()
@@ -132,6 +138,7 @@ user_pending: set[int] = set()
 auth_requested: set[int] = set()   # کاربرانی که برایشان درخواست دسترسی به ادمین فرستاده شده
 admin_pending: dict[int, str] = {}   # chat_id -> نوع ورودی منتظره (limit/channel/allow)
 worker_busy = threading.Event()
+draining = threading.Event()      # چرخه در حال بسته‌شدن است؛ فایل جدید پذیرفته نمی‌شود
 start_ts = time.time()
 stop_event = threading.Event()
 BOT_USERNAME = ""
@@ -194,8 +201,14 @@ def load_state() -> None:
 def commit_state(reason: str = "") -> None:
     if not (GH_TOKEN and GH_REPO):
         return
+    # نسخهٔ کامیت‌شده در ریپوی عمومی، بدون نام کاربری/نام واقعی کاربران (حفظ حریم خصوصی).
+    # روی خود ربات، state کامل می‌ماند.
     with state_lock:
-        payload = json.dumps(state, ensure_ascii=False, indent=1)
+        pub = json.loads(json.dumps(state))  # کپی عمیق
+        for rec in (pub.get("users") or {}).values():
+            rec.pop("name", None)
+            rec.pop("username", None)
+        payload = json.dumps(pub, ensure_ascii=False, indent=1)
     sha = None
     try:
         r = requests.get(f"{GH_API}/contents/{STATE_REPO_PATH}?ref={GH_BRANCH}",
@@ -778,7 +791,9 @@ def handle_callback(cb: dict) -> None:
     elif data == "ad:limit":
         admin_pending[chat] = "limit"
         with state_lock: pl = state["config"].get("page_limit")
-        edit(chat, mid, f"سقف صفحهٔ فعلی: <b>{pl}</b>\nعدد جدید را بفرست (۱ تا ۵۰۰):")
+        edit(chat, mid, f"سقف صفحهٔ فعلی: <b>{pl}</b>\n"
+                        f"عدد جدید را بفرست (۱ تا {MAX_PAGE_LIMIT:,}):\n"
+                        "⚠️ فایل‌های خیلی بزرگ فقط اگر تا پایان چرخهٔ جاری جا شوند قبول می‌شوند.")
     elif data == "ad:speed":
         with state_lock:
             idx = SPEED_ORDER.index(state["config"]["speed"]) if state["config"]["speed"] in SPEED_ORDER else 0
@@ -874,7 +889,7 @@ def handle_admin_text(m: dict) -> None:
     txt = (m.get("text") or "").strip()
     if kind == "limit":
         try:
-            n = max(1, min(500, int(txt)))
+            n = max(1, min(MAX_PAGE_LIMIT, int(txt)))
         except ValueError:
             send(chat, "عدد معتبر بفرست (مثلاً ۵۰).")
             admin_pending[chat] = "limit"
@@ -960,6 +975,9 @@ def cmd_start(m: dict) -> None:
 def on_document(m: dict) -> None:
     chat = m["chat"]["id"]
     uid = m["from"]["id"]
+    if draining.is_set():
+        send(chat, "🔄 ربات در حال تعویض چرخهٔ سرویس است؛ حدوداً ۳ دقیقه بعد همین فایل را دوباره بفرست.")
+        return
     touch_user(m)
     if not force_join_ok(uid):
         with state_lock:
@@ -1050,6 +1068,21 @@ def process_job(job: dict) -> None:
                          f"<b>{page_limit}</b> صفحه است. فایل کوچک‌تری بفرست یا از ادمین سقف را بپرس.")
         in_pdf.unlink(missing_ok=True)
         return
+
+    # ── گیت زمان چرخه: فایل خیلی بزرگ اگر تا سقف سخت جاب جا نشود، وسط کار کشته می‌شود؛
+    #    پس از اول با پیام راهنما رد می‌شود تا در چرخهٔ بعدی (خالی‌تر) پذیرفته شود.
+    if RUN_MAX_MINUTES:
+        needed_min = 5 + n_pages * SEC_PER_PAGE_EST / 60
+        remaining_min = (start_ts + JOB_HARD_MINUTES * 60) - time.time()
+        if needed_min > remaining_min:
+            wait_min = max(int(RUN_MAX_MINUTES - (time.time() - start_ts) / 60) + 5, 5)
+            edit(chat, stid, f"⏳ فایل <b>{n_pages}</b> صفحه‌ای حدوداً <b>{needed_min:.0f} دقیقه</b> "
+                             f"وقت می‌برد؛ اما تا پایان امن این چرخه فقط "
+                             f"<b>{max(remaining_min, 0):.0f} دقیقه</b> مانده.\n"
+                             f"⏱ حدود <b>{wait_min} دقیقه</b> دیگر چرخهٔ تازه شروع می‌شود؛ "
+                             "همین فایل را آن موقع دوباره بفرست تا کامل ترجمه شود.")
+            in_pdf.unlink(missing_ok=True)
+            return
 
     with state_lock:
         speed = state["config"].get("speed", "balanced")
@@ -1314,11 +1347,23 @@ def polling_loop() -> None:
     offset = 0
     backoff = 2
     conflicts = 0
+    drain_noted = False
     while not stop_event.is_set():
-        # حالت Actions: پایان تمیز چرخه قبل از سقف ۶ ساعتهٔ جاب
+        # حالت Actions: پس از پایان چرخه، تا خالی شدن صف ادامه می‌دهیم؛
+        # ترجمهٔ در جریان (مثلاً فایل ۲۰۰۰ صفحه‌ای) نباید وسط کار کشته شود.
         if RUN_MAX_MINUTES and time.time() - start_ts > RUN_MAX_MINUTES * 60:
-            log(f"زمان چرخه تمام شد ({RUN_MAX_MINUTES:.0f} دقیقه) — پایان تمیز.")
-            return
+            if not worker_busy.is_set() and job_q.empty():
+                # تأیید دوم بعد از چند ثانیه: جاب تازه‌ای بین دو بررسی شروع نشده باشد
+                time.sleep(5)
+                if worker_busy.is_set() or not job_q.empty():
+                    continue
+                log(f"زمان چرخه تمام شد ({RUN_MAX_MINUTES:.0f} دقیقه) و صف خالی است — پایان تمیز.")
+                return
+            if not drain_noted:
+                drain_noted = True
+                draining.set()
+                log("زمان چرخه تمام شد؛ در انتظار اتمام کارهای در جریان "
+                    "(فایل جدید پذیرفته نمی‌شود)…")
         try:
             r = requests.get(f"{TG}/getUpdates", params={
                 "offset": offset, "timeout": 30,
@@ -1400,13 +1445,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, bye)
     polling_loop()
 
-    # فقط در پایان تمیز چرخه (حالت Actions) به اینجا می‌رسیم؛
-    # اول کارِ در جریان را تمام می‌کنیم، بعد وضعیت را ذخیره و خارج می‌شویم.
+    # polling_loop فقط وقتی برمی‌گردد که صف خالی و worker بیکار باشد؛
+    # این بلوک فقط برای اطمینان است (عملاً بلافاصله رد می‌شود).
     if RUN_MAX_MINUTES:
-        log("در انتظار پایان ترجمهٔ در جریان (حداکثر ۲۵ دقیقه)…")
-        deadline = time.time() + 25 * 60
-        while (worker_busy.is_set() or not job_q.empty()) and time.time() < deadline:
-            time.sleep(5)
         stop_event.set()
         try:
             commit_state("cycle-end")
