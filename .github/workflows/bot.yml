@@ -35,6 +35,14 @@ jobs:
       - name: نصب وابستگی‌ها
         run: pip install -r requirements.txt
 
+      - name: نصب OpenCode CLI (سرویس ترجمه)
+        run: |
+          if ! command -v opencode >/dev/null 2>&1; then
+            curl -fsSL https://opencode.ai/install | bash
+          fi
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          opencode --version
+
       - name: 🛡 جلوگیری از اجرای موازی
         id: guard
         env:
@@ -60,9 +68,11 @@ jobs:
           exit $code
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          TT_API_KEY: ${{ secrets.TT_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPO: ${{ github.repository }}
           RUN_MAX_MINUTES: "300"

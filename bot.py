@@ -19,6 +19,7 @@ import json
 import os
 import queue
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -34,10 +35,14 @@ import translator_core as core
 # تنظیمات از متغیرهای محیطی
 # --------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-TT_API_KEY = os.environ.get("TT_API_KEY", "").strip()
-TT_BASE = (os.environ.get("TT_BASE", "https://top-tools-ai.com/api/v1").strip().rstrip("/"))
+OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY", "").strip()
+OC_BIN = os.environ.get("OPENCODE_BIN", "opencode").strip() or "opencode"
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
+# MTProto (Telethon) برای دانلود/آپلود فایل‌های بزرگ‌تر از سقف Bot API
+TG_API_ID = int(os.environ.get("TELEGRAM_API_ID", "0") or 0)
+TG_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
+# کاربران مجاز اولیه (کاما جدا)؛ تازه‌کارها پیش‌فرض غیرمجازند تا ادمین تأیید کند
+ALLOWED_ENV = tuple(int(x) for x in os.environ.get("ALLOWED_USERS", "").replace(";", ",").split(",") if x.strip().isdigit())
 GH_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GH_REPO = os.environ.get("GITHUB_REPO", "").strip()  # owner/name
 GH_BRANCH = os.environ.get("GH_BRANCH", "main").strip() or "main"
@@ -49,68 +54,38 @@ PORT = int(os.environ.get("PORT", "10000") or 10000)
 # صفر یعنی بدون سقف (اجرای محلی/Render).
 RUN_MAX_MINUTES = float(os.environ.get("RUN_MAX_MINUTES", "0") or 0)
 
-DEFAULT_PROVIDER = os.environ.get("API_PROVIDER", "ttai").strip() or "ttai"
-DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "Top-Tools-Ai").strip() or "Top-Tools-Ai"
-
-# دو سرویس سازگار با OpenAI: پیش‌فرض Top Tools AI (سهمیهٔ ۱۰M توکن در روز +
-# حداکثر ۵ درخواست همزمان) و Groq به‌عنوان جایگزین (سقف ~۸هزار توکن در دقیقه).
-PROVIDERS = {
-    "ttai": {
-        "label": "Top Tools AI",
-        "base": f"{TT_BASE}/chat/completions",
-        "key": TT_API_KEY,
-        "parallel": True,
-        "models": list(core.TTAI_MODELS),
-    },
-    "groq": {
-        "label": "Groq",
-        "base": core.GROQ_API_URL,
-        "key": GROQ_KEY,
-        "parallel": False,
-        "models": list(core.FREE_MODELS),
-    },
-}
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", core.DEFAULT_MODEL).strip() or core.DEFAULT_MODEL
 
 
-def engine(prov: str | None = None) -> dict:
-    """سرویس فعال فعلی (یا سرویس خواسته‌شده با prov) با مدل معتبرش (از تنظیمات ادمین)."""
+def engine() -> dict:
+    """تنظیمات فعلی سرویس ترجمه (OpenCode Zen از طریق CLI) با مدل انتخابی ادمین."""
     with state_lock:
-        p = prov or state["config"].get("provider", DEFAULT_PROVIDER)
         model = state["config"].get("model", DEFAULT_MODEL)
-    if p not in PROVIDERS:
-        p = "ttai"
-    info = PROVIDERS[p]
-    if model not in info["models"]:
-        model = info["models"][0]
-    return {"prov": p, "label": info["label"], "base": info["base"], "key": info["key"],
-            "parallel": info["parallel"], "models": info["models"], "model": model}
+    if not model:
+        model = DEFAULT_MODEL
+    return {"label": "OpenCode Zen", "model": model}
 
 TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 STATE_REPO_PATH = "data/state.json"
 TMP_DIR = Path("data/tmp")
 
-# «سریع‌ترین زمان ممکن»:
-#   • Top Tools AI: سقف ~۴۵RPM و ۵ درخواست همزمان → ترجمهٔ موازی چند صفحه با ورکرها؛
-#     (تعداد ورکر، فاصلهٔ شروع درخواست‌ها به ثانیه)
-#   • Groq: سقف ~۸هزار توکن در دقیقه → پشت‌سرهم با مکث بین صفحات.
-#     429ها در هر دو حالت خودکار طبق retry-after مدیریت می‌شوند.
-SPEEDS_TT = {"fast": (4, 1.4), "balanced": (3, 2.2), "safe": (2, 3.5)}
-SPEED_LABELS_TT = {"fast": "موازی ×۴ — سریع‌ترین", "balanced": "موازی ×۳ — متعادل", "safe": "موازی ×۲ — محتاط"}
-SPEEDS_GROQ = {"fast": 15.0, "balanced": 25.0, "safe": 40.0}
-SPEED_LABELS_GROQ = {"fast": "حداکثر سرعت (۱۵ث)", "balanced": "متعادل (۲۵ث)", "safe": "محتاط (۴۰ث)"}
+# سرعت ترجمه: (تعداد فراخوانی همزمانِ opencode، فاصلهٔ شروع فراخوانی‌ها به ثانیه)
+# محافظه‌کارانه تا الگوی مصرف شبیه استفادهٔ عادی از OpenCode بماند (ضد بن).
+SPEEDS_OC = {"fast": (3, 2.5), "balanced": (2, 4.0), "safe": (1, 8.0)}
+SPEED_LABELS_OC = {"fast": "موازی ×۳ — سریع‌ترین", "balanced": "موازی ×۲ — متعادل",
+                   "safe": "تک‌کار‌کره — محتاط"}
 SPEED_ORDER = ["fast", "balanced", "safe"]
 
 
 def speed_label(speed: str) -> str:
-    labels = SPEED_LABELS_TT if engine()["parallel"] else SPEED_LABELS_GROQ
-    return labels.get(speed, speed)
+    return SPEED_LABELS_OC.get(speed, speed)
 
 
 # پیام کوتاه فارسی برای خطاهای مرگبار — بدنهٔ خام انگلیسی سرویس به کاربر نشان داده نمی‌شود
 ERR_SHORT = {
     "auth": "کلید سرویس ترجمه نامعتبر است",
-    "access": "دسترسی به سرویس ترجمه مسدود است",
-    "model": "مدل انتخابی روی این سرویس موجود نیست",
+    "access": "دسترسی به سرویس ترجمه مسدود است (ردهٔ رایگان/موجودی/سقف مصرف)",
+    "model": "مدل انتخابی روی سرویس موجود نیست؛ با /model عوضش کن",
     "provider": "سرویس ترجمه موقتاً قطع است (خطای بالادستیِ سرویس)",
     "config": "خطای پیکربندی سرویس ترجمه",
 }
@@ -129,7 +104,7 @@ provider_alert_ts: dict = {}  # label → آخرین زمان هشدار (thrott
 
 
 def alert_admin_provider_down(label: str, err: Exception) -> None:
-    """هشدار قطعی سرویس به ادمین — برای هر سرویس حداکثر هر ۳۰ دقیقه یک‌بار."""
+    """هشدار قطعی/خطای سرویس به ادمین — حداکثر هر ۳۰ دقیقه یک‌بار."""
     now = time.time()
     if now - provider_alert_ts.get(label, 0.0) < 1800:
         return
@@ -138,20 +113,22 @@ def alert_admin_provider_down(label: str, err: Exception) -> None:
         return
     try:
         send(ADMIN_ID,
-             f"⚠️ <b>قطعی سرویس ترجمه: {label}</b>\n"
+             f"⚠️ <b>خطای سرویس ترجمه: {label}</b>\n"
              f"علت: {short_err(err)}\n"
-             "فیلورور خودکار به سرویس جایگزین فعال شد؛ برای تست همهٔ سرویس‌ها /ping بفرست.")
+             "وضعیت سرویس را با /ping چک کن.")
     except TgError:
         pass
 
-MAX_DOWNLOAD = 19 * 1024 * 1024   # سقف دانلود فایل در Bot API تلگرام
+MAX_DOWNLOAD = 19 * 1024 * 1024   # سقف دانلود مستقیم Bot API تلگرام
+MAX_MTPROTO = 1900 * 1024 * 1024  # سقف منطقی فایل با MTProto (~۲GB تلگرام)
 MAX_QUEUE = 6                     # حداکثر فایل در صف
 
 state_lock = threading.RLock()
 dirty = threading.Event()
 job_q: "queue.Queue[dict]" = queue.Queue()
 user_pending: set[int] = set()
-admin_pending: dict[int, str] = {}   # chat_id -> نوع ورودی منتظره (limit/channel)
+auth_requested: set[int] = set()   # کاربرانی که برایشان درخواست دسترسی به ادمین فرستاده شده
+admin_pending: dict[int, str] = {}   # chat_id -> نوع ورودی منتظره (limit/channel/allow)
 worker_busy = threading.Event()
 start_ts = time.time()
 stop_event = threading.Event()
@@ -168,9 +145,11 @@ def _default_state() -> dict:
             "page_limit": DEFAULT_PAGE_LIMIT,
             "force_join": FORCE_JOIN_ENABLED,
             "channel": FORCE_JOIN_CHANNEL,
-            "speed": "fast",
-            "provider": DEFAULT_PROVIDER,
+            "speed": "balanced",
             "model": DEFAULT_MODEL,
+            "src_lang": "auto",
+            "dst_lang": "fa",
+            "allowed": list(ALLOWED_ENV),
         },
         "users": {},
         "totals": {"files": 0, "pages": 0},
@@ -316,6 +295,151 @@ def upload_document(chat_id, path: Path, caption: str):
 
 
 # --------------------------------------------------------------------------
+# OpenCode Zen — کلید فقط «موقع ترجمه» روشن می‌شود و بعد از کار خاموش (ضد بن)
+# --------------------------------------------------------------------------
+AUTH_JSON_PATH = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+
+
+def opencode_arm() -> None:
+    """نوشتن احراز OpenCode در محل فایل خود CLI — فقط پیش از شروع ترجمه."""
+    if not OPENCODE_API_KEY:
+        raise RuntimeError("کلید OPENCODE_API_KEY تنظیم نشده است.")
+    AUTH_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    AUTH_JSON_PATH.write_text(
+        json.dumps({"zen": {"type": "api", "key": OPENCODE_API_KEY}}), encoding="utf-8")
+    log("سرویس ترجمه (OpenCode) روشن شد.")
+
+
+def opencode_disarm() -> None:
+    """حذف احراز OpenCode — بعد از پایان ترجمه؛ بین ترجمه‌ها هیچ کلیدی روی دیسک نیست."""
+    try:
+        AUTH_JSON_PATH.unlink()
+        log("سرویس ترجمه (OpenCode) خاموش شد.")
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        log(f"خاموش‌کردن OpenCode ناموفق بود: {e}")
+
+
+def list_free_models() -> list[str]:
+    """فهرست مدل‌های رایگان از خود CLI (لیست محلی، بدون مصرف کلید)."""
+    try:
+        binp = core.find_opencode(OC_BIN)
+        if binp:
+            out = subprocess.run([binp, "models"], capture_output=True, text=True,
+                                 timeout=90, stdin=subprocess.DEVNULL).stdout or ""
+            ms = []
+            for ln in out.splitlines():
+                ln = ln.strip()
+                if "/" in ln:
+                    name = ln.split("/", 1)[1].split()[0]
+                    if name not in ms:
+                        ms.append(name)
+            free = [m for m in ms if m.endswith("-free") or m == "big-pickle"]
+            if free:
+                return free
+    except Exception as e:  # noqa: BLE001
+        log(f"خواندن لیست مدل‌های OpenCode ناموفق بود: {e}")
+    return list(core.OPENCODE_FREE_MODELS)
+
+
+# --------------------------------------------------------------------------
+# MTProto (Telethon) — دانلود/آپلود فایل‌های بزرگ‌تر از سقف Bot API
+# --------------------------------------------------------------------------
+class MTProtoClient:
+    """کلاینت Telethon همیشه‌روشن در یک ترد جدا با event loop خودش؛
+    آپدیت‌های واقعی را می‌گیرد تا access_hash کاربران/چت‌ها کش شود."""
+
+    def __init__(self) -> None:
+        self._client = None
+        self._loop = None
+        self.ready = threading.Event()
+
+    def start(self) -> None:
+        if not (TG_API_ID and TG_API_HASH):
+            log("MTProto تنظیم نشده (TELEGRAM_API_ID/HASH) — فایل‌های بزرگ پشتیبانی نمی‌شوند.")
+            return
+        try:
+            import telethon  # noqa: F401
+        except Exception as e:  # noqa: BLE001
+            log(f"telethon نصب نیست؛ فایل‌های بزرگ پشتیبانی نمی‌شوند: {e}")
+            return
+
+        def _runner():
+            import asyncio
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            try:
+                self._loop.run_until_complete(self._boot())
+            except Exception as e:  # noqa: BLE001
+                log(f"MTProto راه‌اندازی نشد: {e}")
+                return
+            self.ready.set()
+            self._loop.run_forever()
+
+        threading.Thread(target=_runner, daemon=True, name="mtproto").start()
+
+    async def _boot(self):
+        from telethon import TelegramClient
+        from telethon.sessions import StringSession
+        self._client = TelegramClient(StringSession(), TG_API_ID, TG_API_HASH,
+                                      request_retries=3, connection_retries=5)
+        await self._client.start(bot_token=BOT_TOKEN)
+        log("MTProto متصل شد.")
+
+    def _call(self, coro_fn, timeout: float = 1800.0):
+        if not (self.ready.is_set() and self._client and self._loop):
+            return None
+        try:
+            fut = asyncio.run_coroutine_threadsafe(coro_fn(), self._loop)
+            return fut.result(timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            log(f"MTProto call ناموفق بود: {e}")
+            return None
+
+    def download(self, chat_id: int, message_id: int, dest: Path) -> bool:
+        """دانلود مدیای یک پیام با MTProto (بدون سقف ۲۰MB Bot API)."""
+        import asyncio
+
+        async def _do():
+            msg = None
+            # گاهی کش entity هنوز کامل نیست؛ چند بار با مکث کوتاه تلاش می‌کنیم
+            for i in range(5):
+                try:
+                    msg = await self._client.get_messages(int(chat_id), ids=int(message_id))
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if i == 4:
+                        raise
+                    await asyncio.sleep(2 + i * 2)
+            if not msg or not msg.document:
+                return False
+            out = await self._client.download_media(msg, file=str(dest))
+            p = Path(str(out)) if out else dest
+            return p.exists() and p.stat().st_size > 0
+
+        return bool(self._call(_do))
+
+    def upload(self, chat_id: int, path: Path, caption: str) -> bool:
+        """ارسال فایل خروجی بزرگ با MTProto (بدون سقف ۵۰MB Bot API)."""
+        import asyncio
+
+        async def _do():
+            await self._client.send_file(int(chat_id), str(path), caption=caption[:1024],
+                                         parse_mode="html", force_document=True)
+            return True
+
+        return bool(self._call(_do, timeout=3600.0))
+
+
+MT = MTProtoClient()
+
+
+def mtproto_ready() -> bool:
+    return MT.ready.is_set()
+
+
+# --------------------------------------------------------------------------
 # force join و کاربران
 # --------------------------------------------------------------------------
 def channel_ref(ch: str) -> str:
@@ -373,6 +497,78 @@ def is_admin(uid) -> bool:
         return False
 
 
+def is_allowed(uid) -> bool:
+    """کاربران تازه پیش‌فرض غیرمجازند؛ فقط ادمین و فهرست تأییدشده‌ها حق استفاده دارند."""
+    if is_admin(uid):
+        return True
+    try:
+        u = int(uid)
+    except (TypeError, ValueError):
+        return False
+    with state_lock:
+        return u in (state["config"].get("allowed") or [])
+
+
+def allow_user(uid: int) -> None:
+    with state_lock:
+        lst = state["config"].setdefault("allowed", [])
+        if uid not in lst:
+            lst.append(uid)
+    dirty.set()
+
+
+def deny_user(uid: int) -> None:
+    with state_lock:
+        lst = state["config"].setdefault("allowed", [])
+        if uid in lst:
+            lst.remove(uid)
+    dirty.set()
+
+
+def user_display_name(uid: int, m: dict | None = None) -> str:
+    if m:
+        u = m.get("from", {}) or {}
+        nm = (u.get("first_name") or "") + ((" " + u["last_name"]) if u.get("last_name") else "")
+        if nm.strip():
+            return nm.strip()
+    with state_lock:
+        rec = state["users"].get(str(uid)) or {}
+    return rec.get("name") or rec.get("username") or ""
+
+
+def request_access(m: dict, *, silent: bool = False) -> None:
+    """کاربر غیرمجاز: پاسخ به او + درخواست تأیید با دکمه برای ادمین."""
+    uid = m.get("from", {}).get("id")
+    chat = m.get("chat", {}).get("id")
+    if not uid or chat is None or not ADMIN_ID:
+        return
+    if not silent:
+        try:
+            send(chat, "⛔️ شما هنوز مجاز به استفاده از این ربات نیستید.\n"
+                       "درخواست دسترسی برای ادمین ارسال شد؛ بعد از تأیید می‌توانید فایل بفرستید.")
+        except TgError:
+            pass
+    if uid in auth_requested:
+        return  # درخواست قبلاً ثبت شده؛ ادمین را اسپم نکن
+    auth_requested.add(uid)
+    u = m.get("from", {}) or {}
+    uname = f"@{u['username']}" if u.get("username") else ""
+    nm = html_mod.escape(user_display_name(uid, m))
+    kb = {"inline_keyboard": [[
+        {"text": "✅ تأیید دسترسی", "callback_data": f"authok:{uid}"},
+        {"text": "❌ رد", "callback_data": f"authno:{uid}"},
+    ]]}
+    try:
+        send(ADMIN_ID,
+             f"🔔 <b>درخواست دسترسی جدید</b>\n"
+             f"👤 {nm or 'کاربر'}" + (f" ({uname})" if uname else "") + f"\n"
+             f"🆔 <code>{uid}</code>\n\n"
+             "برای اجازهٔ استفاده، تأیید کن:",
+             reply_markup=kb)
+    except TgError:
+        pass
+
+
 def stats_text() -> str:
     with state_lock:
         users = state["users"]
@@ -390,8 +586,9 @@ def stats_text() -> str:
             f"📄 صفحه‌های ترجمه‌شده: {totals.get('pages', 0)}",
             f"⏳ صف فعلی: {job_q.qsize()}",
             f"⚡ سرعت: {speed_label(cfg.get('speed'))}",
-            f"🤖 سرویس: {PROVIDERS.get(cfg.get('provider'), PROVIDERS['ttai'])['label']} — <code>{cfg.get('model')}</code>",
-            "🔁 فیلورور خودکار: فعال (قطعی سرویس → سرویس جایگزین)",
+            f"🤖 سرویس: OpenCode Zen — <code>{cfg.get('model')}</code>",
+            f"🌐 زبان: {cfg.get('src_lang', 'auto')} → {cfg.get('dst_lang', 'fa')}",
+            f"🛡 کاربران مجاز: {len(cfg.get('allowed') or [])}",
             f"🧮 توکن مصرفی کل: {totals.get('tokens', 0):,}",
             f"⏱ آپ‌تایم: {(now - start_ts) // 60:.0f} دقیقه",
         ]
@@ -408,17 +605,67 @@ def admin_menu() -> dict:
     with state_lock:
         c = dict(state["config"])
     b = lambda t, d: {"text": t, "callback_data": d}  # noqa: E731
-    prov = PROVIDERS.get(c.get("provider"), PROVIDERS["ttai"])
+    src = c.get("src_lang", "auto")
+    dst = c.get("dst_lang", "fa")
     return {"inline_keyboard": [
         [b("📊 آمار کاربران", "ad:stats")],
-        [b(f"🤖 سرویس: {prov['label']}", "ad:provider"),
+        [b(f"🧠 مدل: {c.get('model')}", "ad:model"),
          b(f"⚡ سرعت: {speed_label(c.get('speed'))}", "ad:speed")],
-        [b(f"🧠 مدل: {c.get('model')}", "ad:model")],
-        [b(f"📄 سقف صفحه: {c.get('page_limit')}", "ad:limit")],
-        [b(f"📢 کانال اجباری: {'✅ روشن' if c.get('force_join') else '❌ خاموش'}", "ad:toggle")],
-        [b(f"🔗 کانال: {c.get('channel') or '— تنظیم نشده —'}", "ad:channel")],
+        [b(f"🌐 زبان: {src} → {dst}", "ad:lang")],
+        [b(f"📄 سقف صفحه: {c.get('page_limit')}", "ad:limit"),
+         b(f"📢 کانال اجباری: {'✅ روشن' if c.get('force_join') else '❌ خاموش'}", "ad:toggle")],
+        [b(f"🔗 کانال: {c.get('channel') or '— تنظیم نشده —'}", "ad:channel"),
+         b(f"🛡 مجاز: {len(c.get('allowed') or [])}", "ad:allowed")],
         [b("💾 ذخیرهٔ دستی وضعیت", "ad:sync")],
     ]}
+
+
+def model_menu() -> dict:
+    """دکمه‌های انتخاب مدل رایگان (۳تایی در هر ردیف)."""
+    with state_lock:
+        cur = state["config"].get("model", DEFAULT_MODEL)
+    models = list_free_models()
+    if cur not in models:
+        models.insert(0, cur)
+    rows, row = [], []
+    for m in models:
+        label = ("✅ " if m == cur else "") + m
+        row.append({"text": label, "callback_data": f"mdl:{m}"[:64]})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "↺ تازه‌سازی لیست", "callback_data": "ad:model"}])
+    return {"inline_keyboard": rows}
+
+
+SRC_CHOICES = [("auto", "خودکار"), ("en", "انگلیسی"), ("ar", "عربی"), ("fr", "فرانسوی"),
+               ("de", "آلمانی"), ("tr", "ترکی"), ("ru", "روسی"), ("zh", "چینی"),
+               ("es", "اسپانیایی"), ("it", "ایتالیایی"), ("pt", "پرتغالی")]
+DST_CHOICES = [("fa", "فارسی"), ("en", "انگلیسی"), ("ar", "عربی"), ("tr", "ترکی")]
+
+
+def lang_menu() -> dict:
+    with state_lock:
+        c = dict(state["config"])
+    rows = [[{"text": "— زبان مبدأ —"}]]
+    row = []
+    for code, label in [x for x in SRC_CHOICES if x[1]]:
+        mark = "✅ " if code == c.get("src_lang", "auto") else ""
+        row.append({"text": f"{mark}{label}", "callback_data": f"lsrc:{code}"})
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "— زبان مقصد —"}])
+    row = []
+    for code, label in DST_CHOICES:
+        mark = "✅ " if code == c.get("dst_lang", "fa") else ""
+        row.append({"text": f"{mark}{label}", "callback_data": f"ldst:{code}"})
+    rows.append(row)
+    return {"inline_keyboard": rows}
 
 
 def handle_callback(cb: dict) -> None:
@@ -431,7 +678,10 @@ def handle_callback(cb: dict) -> None:
         api("answerCallbackQuery", callback_query_id=cb["id"], timeout=15)
     except TgError:
         pass
-    if not chat or not is_admin(uid):
+    if not chat:
+        return
+    # دکمهٔ بررسی مجدد عضویت مال کاربران عادی است؛ بقیه فقط ادمین
+    if not is_admin(uid) and data != "check_join":
         return
     if data == "ad:stats":
         edit(chat, mid, stats_text(), reply_markup=admin_menu())
@@ -445,22 +695,63 @@ def handle_callback(cb: dict) -> None:
             state["config"]["speed"] = SPEED_ORDER[(idx + 1) % len(SPEED_ORDER)]
         dirty.set()
         edit(chat, mid, "پنل ادمین ⚙️", reply_markup=admin_menu())
-    elif data == "ad:provider":
-        with state_lock:
-            cur = state["config"].get("provider", DEFAULT_PROVIDER)
-            nxt = "groq" if cur == "ttai" else "ttai"
-            state["config"]["provider"] = nxt
-            state["config"]["model"] = PROVIDERS[nxt]["models"][0]
-        dirty.set()
-        edit(chat, mid, "پنل ادمین ⚙️", reply_markup=admin_menu())
     elif data == "ad:model":
+        edit(chat, mid, "🧠 مدل ترجمه را انتخاب کن (مدل‌های رایگان OpenCode Zen):",
+             reply_markup=model_menu())
+    elif data.startswith("mdl:"):
+        mdl = data[4:]
         with state_lock:
-            prov = state["config"].get("provider", DEFAULT_PROVIDER)
-            models = PROVIDERS.get(prov, PROVIDERS["ttai"])["models"]
-            cur = state["config"].get("model", DEFAULT_MODEL)
-            state["config"]["model"] = models[(models.index(cur) + 1) % len(models)] if cur in models else models[0]
+            state["config"]["model"] = mdl
         dirty.set()
-        edit(chat, mid, "پنل ادمین ⚙️", reply_markup=admin_menu())
+        edit(chat, mid, f"مدل شد: <b>{mdl}</b> ✅", reply_markup=model_menu())
+    elif data == "ad:lang":
+        edit(chat, mid, "🌐 زبان مبدأ و مقصد را انتخاب کن:", reply_markup=lang_menu())
+    elif data.startswith("lsrc:"):
+        code = data[5:]
+        with state_lock:
+            state["config"]["src_lang"] = code
+        dirty.set()
+        edit(chat, mid, f"زبان مبدأ: <b>{code}</b>", reply_markup=lang_menu())
+    elif data.startswith("ldst:"):
+        code = data[5:]
+        with state_lock:
+            state["config"]["dst_lang"] = code
+        dirty.set()
+        edit(chat, mid, f"زبان مقصد: <b>{code}</b>\n(برای مقصد راست‌به‌چپ، چیدمان آینه‌ای می‌شود)",
+             reply_markup=lang_menu())
+    elif data == "ad:allowed":
+        with state_lock:
+            lst = list(state["config"].get("allowed") or [])
+        names = []
+        for u in lst[:20]:
+            rec = state["users"].get(str(u)) or {}
+            nm = rec.get("name") or rec.get("username") or ""
+            names.append(f"• <code>{u}</code>" + (f" — {html_mod.escape(nm)}" if nm else ""))
+        edit(chat, mid,
+             f"🛡 کاربران مجاز ({len(lst)}):\n" + ("\n".join(names) or "— هیچ —") +
+             "\n\nاضافهٔ دستی: /allow &lt;آیدی&gt;\nحذف: /deny &lt;آیدی&gt;",
+             reply_markup=admin_menu())
+    elif data.startswith("authok:") or data.startswith("authno:"):
+        act, suid = data.split(":", 1)
+        try:
+            suid_i = int(suid)
+        except ValueError:
+            return
+        if act == "authok":
+            allow_user(suid_i)
+            edit(chat, mid, f"✅ دسترسی کاربر <code>{suid_i}</code> تأیید و ذخیره شد.")
+            try:
+                send(suid_i, "✅ دسترسی شما به ربات تأیید شد!\nحالا می‌توانی فایل PDF بفرستی.")
+            except TgError:
+                pass
+        else:
+            deny_user(suid_i)
+            edit(chat, mid, f"❌ درخواست کاربر <code>{suid_i}</code> رد شد.")
+            try:
+                send(suid_i, "متأسفانه درخواست دسترسی شما رد شد.")
+            except TgError:
+                pass
+        auth_requested.discard(suid_i)
     elif data == "ad:toggle":
         with state_lock:
             state["config"]["force_join"] = not bool(state["config"].get("force_join"))
@@ -512,29 +803,50 @@ def handle_admin_text(m: dict) -> None:
         dirty.set()
         with state_lock: ch = state["config"].get("channel", "")
         send(chat, f"کانال: <b>{ch or 'خاموش'}</b>", reply_markup=admin_menu())
+    elif kind == "allow":
+        if txt.lower() in ("لغو", "off", "-"):
+            send(chat, "عملیات لغو شد.", reply_markup=admin_menu())
+            return
+        try:
+            uid = int(txt.lstrip("@"))
+            allow_user(uid)
+            send(chat, f"✅ کاربر <code>{uid}</code> به فهرست مجاز اضافه شد.", reply_markup=admin_menu())
+            try:
+                send(uid, "✅ دسترسی شما به ربات تأیید شد!\nحالا می‌توانی فایل PDF بفرستی.")
+            except TgError:
+                pass
+        except ValueError:
+            send(chat, "آیدی عددی معتبر بفرست (مثل ۷۴۳۳۳۵۷۷۰۰) یا /allow را دوباره بزن.")
+            admin_pending[chat] = "allow"
 
 
 # --------------------------------------------------------------------------
 # پردازش فایل‌ها
 # --------------------------------------------------------------------------
 WELCOME = (
-    "👋 <b>مترجم PDF انگلیسی → فارسی</b>\n\n"
-    "فایل PDF انگلیسی را بفرست تا با حفظ چیدمان (موقعیت، اندازه، بولد/رنگ) "
-    "به فارسی ترجمه و راست‌به‌چپ برگردانده شود.\n\n"
+    "👋 <b>مترجم PDF با هوش مصنوعی</b>\n\n"
+    "فایل PDF را بفرست تا با حفظ چیدمان (موقعیت، اندازه، بولد/رنگ، جدول‌ها و عکس‌ها) "
+    "به زبان مقصد ترجمه و راست‌چین تحویل داده شود.\n\n"
     "📄 سقف فعلی: تا <b>{limit}</b> صفحه برای هر فایل\n"
     "🤖 موتور: {engine} — مدل <code>{model}</code>\n"
-    "⚡ صفحات به‌صورت <b>موازی</b> ترجمه می‌شوند تا سریع‌ترین جواب را بگیری\n\n"
+    "🌐 زبان: {src} → {dst}\n"
+    "📎 فایل‌های بزرگ تا ~۲ گیگابایت هم پذیرفته می‌شود\n\n"
     "💡 فقط کافیست فایل را بفرست؛ پیشرفت ترجمه را همین‌جا نشان می‌دهم."
 )
 
 HELP = (
-    "📄 کافیست فایل PDF انگلیسی را بفرستی (نه لینک، نه عکس).\n"
+    "📄 کافیست فایل PDF را بفرستی (نه لینک، نه عکس).\n"
     f"سقف صفحه: تا <b>{{limit}}</b> صفحه در هر فایل.\n"
-    "ترجمه وفادار به متن اصلی است و چیدمان (جای متن، اندازه، بولد، رنگ) "
-    "حفظ و چیدمان به‌صورت آینه‌ای راست‌چین می‌شود.\n\n"
+    "ترجمه وفادار به متن اصلی است و چیدمان (جای متن، عکس، جدول، اندازه، بولد، رنگ) "
+    "حفظ و برای زبان مقصد راست‌چین/آینه‌ای می‌شود.\n\n"
     "دستورها:\n"
     "/start — شروع\n/help — همین راهنما\n/id — آیدی عددی تو"
 )
+
+LANG_LABEL = {"auto": "خودکار", "en": "انگلیسی", "fa": "فارسی", "ar": "عربی", "fr": "فرانسوی",
+              "de": "آلمانی", "es": "اسپانیایی", "it": "ایتالیایی", "pt": "پرتغالی",
+              "tr": "ترکی", "ru": "روسی", "zh": "چینی", "ja": "ژاپنی", "ko": "کره‌ای",
+              "hi": "هندی", "ur": "اردو"}
 
 
 def cmd_start(m: dict) -> None:
@@ -548,8 +860,11 @@ def cmd_start(m: dict) -> None:
         return
     with state_lock:
         pl = int(state["config"].get("page_limit", 40))
+        src = state["config"].get("src_lang", "auto")
+        dst = state["config"].get("dst_lang", "fa")
     eng = engine()
-    send(chat, WELCOME.format(limit=pl, engine=eng["label"], model=eng["model"]))
+    send(chat, WELCOME.format(limit=pl, engine=eng["label"], model=eng["model"],
+                              src=LANG_LABEL.get(src, src), dst=LANG_LABEL.get(dst, dst)))
 
 
 def on_document(m: dict) -> None:
@@ -566,9 +881,13 @@ def on_document(m: dict) -> None:
     if not name.lower().endswith(".pdf"):
         send(chat, "فقط فایل PDF بفرست (فایل ورد/عکس قابل ترجمه نیست).")
         return
-    if int(doc.get("file_size", 0) or 0) > MAX_DOWNLOAD:
-        send(chat, "حجم فایل بیشتر از ۱۹ مگابایت است (سقف دانلود Bot API تلگرام). "
-                   "فایل را سبک‌تر بفرست یا چند بخشش کن.")
+    fsize = int(doc.get("file_size", 0) or 0)
+    if fsize > MAX_MTPROTO:
+        send(chat, "❌ حجم فایل از ~۲ گیگابایت بیشتر است؛ تلگرام اجازه نمی‌دهد.")
+        return
+    if fsize > MAX_DOWNLOAD and not mtproto_ready():
+        send(chat, "⚠️ حجم فایل بیشتر از ۱۹ مگابایت است و پشتیبانی فایل بزرگ (MTProto) "
+                   "هنوز آماده نیست؛ چند لحظه بعد دوباره امتحان کن یا فایل را سبک‌تر بفرست.")
         return
     if uid in user_pending:
         send(chat, "⏳ یک فایل از تو در حال ترجمه است؛ صبر کن تمام شود.")
@@ -577,7 +896,8 @@ def on_document(m: dict) -> None:
         send(chat, "صف ربات پر است؛ چند دقیقه بعد دوباره امتحان کن.")
         return
     user_pending.add(uid)
-    job_q.put({"chat": chat, "uid": uid, "file_id": doc["file_id"], "name": name,
+    job_q.put({"chat": chat, "uid": uid, "file_id": doc["file_id"],
+               "mid": m.get("message_id"), "size": fsize, "name": name,
                "uname": (m.get("from", {}) or {}).get("username") or ""})
     send(chat, f"🟡 فایل در صف قرار گرفت (جایگاه {job_q.qsize()}). "
                "به‌محض شروع ترجمه خبر می‌دهم.")
@@ -586,6 +906,8 @@ def on_document(m: dict) -> None:
 def process_job(job: dict) -> None:
     chat, uid = job["chat"], job["uid"]
     file_id, name = job["file_id"], job["name"]
+    fsize = int(job.get("size", 0) or 0)
+    mid = job.get("mid")
     st = send(chat, "⬇️ در حال دریافت فایل…")
     stid = st["message_id"]
     last_edit = [0.0]
@@ -598,21 +920,30 @@ def process_job(job: dict) -> None:
             except TgError:
                 pass
 
-    try:
-        f = api("getFile", file_id=file_id, timeout=30)
-        fp = f.get("file_path", "")
-        r = requests.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{fp}", timeout=180)
-        r.raise_for_status()
-        data = r.content
-    except Exception as e:  # noqa: BLE001
-        edit(chat, stid, f"❌ خطا در دانلود فایل: <code>{e}</code>")
-        return
-
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     stamp = int(time.time())
     in_pdf = TMP_DIR / f"{uid}_{stamp}_in.pdf"
     out_pdf = TMP_DIR / f"{uid}_{stamp}_fa.pdf"
-    in_pdf.write_bytes(data)
+
+    # ── دانلود: فایل‌های ≤۱۹MB از Bot API؛ بزرگ‌تر از طریق MTProto (تا ~۲GB)
+    try:
+        if fsize > MAX_DOWNLOAD:
+            if not mtproto_ready():
+                raise RuntimeError("پشتیبانی MTProto برای فایل‌های بزرگ هنوز آماده نیست.")
+            edit(chat, stid, f"⬇️ فایل بزرگ ({fsize / (1024 * 1024):.0f} مگابایت) — "
+                             "دانلود با MTProto…")
+            if not MT.download(chat, int(mid or 0), in_pdf):
+                raise RuntimeError("دانلود MTProto ناموفق بود.")
+        else:
+            f = api("getFile", file_id=file_id, timeout=30)
+            fp = f.get("file_path", "")
+            r = requests.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{fp}", timeout=180)
+            r.raise_for_status()
+            in_pdf.write_bytes(r.content)
+    except Exception as e:  # noqa: BLE001
+        edit(chat, stid, f"❌ خطا در دانلود فایل: <code>{html_mod.escape(str(e))[:140]}</code>")
+        in_pdf.unlink(missing_ok=True)
+        return
 
     try:
         with pymupdf.open(str(in_pdf)) as d:
@@ -631,16 +962,11 @@ def process_job(job: dict) -> None:
         return
 
     with state_lock:
-        speed = state["config"].get("speed", "fast")
-    # زنجیرهٔ فیلورور: سرویس فعال اول؛ اگر قطع/مسدود بود (401 بالادستی، کلید،
-    # دسترسی، مدل) خودکار با سرویس بعدیِ دارای کلید ادامه می‌دهیم.
-    primary = engine()
-    chain = ([primary] if primary["key"] else []) + \
-            [engine(p) for p in PROVIDERS if p != primary["prov"] and PROVIDERS[p]["key"]]
-    if not chain:
-        edit(chat, stid, "❌ هیچ کلیدی برای سرویس‌های ترجمه تنظیم نشده است؛ به ادمین خبر بده.")
-        in_pdf.unlink(missing_ok=True)
-        return
+        speed = state["config"].get("speed", "balanced")
+        src_lang = state["config"].get("src_lang", "auto")
+        dst_lang = state["config"].get("dst_lang", "fa")
+    w, sp = SPEEDS_OC.get(speed, SPEEDS_OC["balanced"])
+    eng = engine()
     t0 = time.time()
 
     def progress(done: int, total: int) -> None:
@@ -648,73 +974,71 @@ def process_job(job: dict) -> None:
         bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
         upd(f"🔄 ترجمه: {bar} {done}/{total} صفحه ({pct}٪)")
 
-    res = None
-    last_fatal: Exception | None = None
-    for attempt, eng in enumerate(chain):
-        if eng["parallel"]:
-            w, sp = SPEEDS_TT.get(speed, SPEEDS_TT["fast"])
-            start_msg = (f"🌍 شروع ترجمهٔ موازی <b>{n_pages}</b> صفحه با "
-                         f"<code>{eng['model']}</code> ({w} ورکر)…")
-        else:
-            start_msg = f"🌍 شروع ترجمهٔ <b>{n_pages}</b> صفحه با <code>{eng['model']}</code>…"
-        if attempt > 0:
-            upd(f"⚠️ سرویس <b>{chain[attempt - 1]['label']}</b> در دسترس نیست؛ "
-                + start_msg.replace("🌍 شروع", "ادامه"), force=True)
-        else:
-            upd(start_msg, force=True)
-        try:
-            if eng["parallel"]:
-                res = core.translate_pdf(str(in_pdf), str(out_pdf), eng["key"], model=eng["model"],
-                                         base_url=eng["base"], workers=w, spacing=sp,
-                                         progress=progress, cancelled=None,
-                                         log=lambda *a: None, mirror=True)
-            else:
-                res = core.translate_pdf(str(in_pdf), str(out_pdf), eng["key"], model=eng["model"],
-                                         base_url=eng["base"], delay=SPEEDS_GROQ.get(speed, 15.0),
-                                         progress=progress, cancelled=None,
-                                         log=lambda *a: None, mirror=True)
-            break
-        except core.FatalTranslationError as err:
-            last_fatal = err
-            log(f"سرویس {eng['label']} شکست خورد (کد {getattr(err, 'code', 'config')}): {err}")
-            alert_admin_provider_down(eng["label"], err)
-            continue
-        except core.TranslationError as err:
-            edit(chat, stid, f"❌ ترجمه ناتمام ماند: {short_err(err)}\n"
-                             "سرویس ترجمه شلوغ است؛ چند دقیقه بعد دوباره امتحان کن.")
-            in_pdf.unlink(missing_ok=True)
-            return
-    if res is None:
-        edit(chat, stid, "❌ ترجمه انجام نشد: "
-             + (short_err(last_fatal) if last_fatal else "هیچ سرویس ترجمه‌ای پاسخگو نبود")
-             + "\nبه ادمین خبر بده.")
+    upd(f"🌍 شروع ترجمهٔ <b>{n_pages}</b> صفحه با <code>{eng['model']}</code> "
+        f"({LANG_LABEL.get(src_lang, src_lang)} → {LANG_LABEL.get(dst_lang, dst_lang)})…",
+        force=True)
+
+    # سرویس ترجمه فقط برای همین ترجمه «روشن» و بعد از کار «خاموش» می‌شود (ضد بن)
+    try:
+        opencode_arm()
+    except Exception as e:  # noqa: BLE001
+        edit(chat, stid, f"❌ سرویس ترجمه آماده نیست: <code>{html_mod.escape(str(e))[:140]}</code>")
         in_pdf.unlink(missing_ok=True)
         return
+    try:
+        res = core.translate_pdf(str(in_pdf), str(out_pdf), "", model=eng["model"],
+                                 base_url="", workers=w, spacing=sp,
+                                 progress=progress, cancelled=None,
+                                 log=lambda *a: None, mirror=True,
+                                 src_lang=src_lang, dst_lang=dst_lang, use_cli=True,
+                                 oc_bin=OC_BIN, oc_cwd=str(TMP_DIR))
+    except core.FatalTranslationError as err:
+        alert_admin_provider_down("OpenCode Zen", err)
+        edit(chat, stid, "❌ ترجمه انجام نشد: " + short_err(err) + "\nبه ادمین خبر بده.")
+        in_pdf.unlink(missing_ok=True)
+        return
+    except core.TranslationError as err:
+        edit(chat, stid, f"❌ ترجمه ناتمام ماند: {short_err(err)}\n"
+                         "سرویس ترجمه شلوغ است؛ چند دقیقه بعد دوباره امتحان کن.")
+        in_pdf.unlink(missing_ok=True)
+        return
+    except Exception as e:  # noqa: BLE001
+        edit(chat, stid, f"❌ خطای غیرمنتظره در ترجمه: <code>{html_mod.escape(str(e))[:140]}</code>")
+        in_pdf.unlink(missing_ok=True)
+        return
+    finally:
+        opencode_disarm()
     usage = (res or {}).get("usage", {})
 
     secs = time.time() - t0
     out_mb = out_pdf.stat().st_size / (1024 * 1024)
     upd("📤 در حال ارسال فایل ترجمه‌شده…", force=True)
-    if out_mb > 49.5:
-        edit(chat, stid, f"❌ فایل خروجی ({out_mb:.0f} مگابایت) از سقف ۵۰ مگابایتی تلگرام بزرگ‌تر است؛ "
-                         "فایل کوچک‌تری بفرست.")
-        in_pdf.unlink(missing_ok=True)
-        out_pdf.unlink(missing_ok=True)
-        return
     failed_n = len((res or {}).get("failed_pages", []))
-    cap = (f"✅ ترجمهٔ «{name}» — {n_pages} صفحه در {secs / 60:.1f} دقیقه"
+    cap = (f"✅ ترجمهٔ «{html_mod.escape(name)}» — {n_pages} صفحه در {secs / 60:.1f} دقیقه"
            f" | حجم: {out_mb:.1f}MB")
     if failed_n:
         cap += f"\n⚠️ {failed_n} صفحه به‌خاطر خطای سرویس ترجمه نشد (متن اصلی ماند)."
-    try:
-        upload_document(chat, out_pdf, cap)
-    except TgError as e:
-        edit(chat, stid, f"❌ ارسال فایل ناموفق بود: <code>{e}</code>")
-        in_pdf.unlink(missing_ok=True)
-        out_pdf.unlink(missing_ok=True)
-        return
+
+    # ── آپلود: ≤۴۹.۵MB با Bot API؛ بزرگ‌تر (یا اگر Bot API شکست خورد) با MTProto
+    sent = False
+    if out_mb <= 49.5:
+        try:
+            upload_document(chat, out_pdf, cap)
+            sent = True
+        except TgError as e:
+            log(f"آپلود Bot API ناموفق بود؛ تلاش با MTProto: {e}")
+    if not sent:
+        if mtproto_ready():
+            upd("📤 فایل بزرگ است — ارسال با MTProto…")
+            sent = MT.upload(chat, out_pdf, cap)
+        if not sent:
+            edit(chat, stid, f"❌ ارسال فایل ({out_mb:.1f} مگابایت) ناموفق بود؛ دوباره امتحان کن.")
+            in_pdf.unlink(missing_ok=True)
+            out_pdf.unlink(missing_ok=True)
+            return
     in_pdf.unlink(missing_ok=True)
     out_pdf.unlink(missing_ok=True)
+
 
     total_tokens = int(usage.get("total_tokens", 0) or 0)
     with state_lock:
@@ -780,9 +1104,10 @@ def health_server() -> None:
                 "queue": job_q.qsize(),
                 "busy": worker_busy.is_set(),
                 "users": len(state.get("users", {})),
-                "provider": state.get("config", {}).get("provider"),
                 "model": state.get("config", {}).get("model"),
                 "speed": state.get("config", {}).get("speed"),
+                "mtproto": mtproto_ready(),
+                "opencode": bool(OPENCODE_API_KEY),
             }, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -812,6 +1137,16 @@ def handle_message(m: dict) -> None:
     if is_admin(uid) and chat_id in admin_pending and text and not text.startswith("/"):
         handle_admin_text(m)
         return
+    # ── دروازهٔ مجوز: کاربران جدید پیش‌فرض غیرمجازند؛ ادمین تأیید می‌کند
+    if not is_allowed(uid):
+        if text.startswith("/id"):
+            send(chat_id, f"آیدی عددی تو: <code>{uid}</code>")
+            return
+        touch_user(m)
+        request_access(m, silent=(uid in auth_requested))
+        if uid in auth_requested:
+            send(chat_id, "درخواست شما قبلاً ثبت شده؛ منتظر تأیید ادمین باش.")
+        return
     if text.startswith("/start"):
         cmd_start(m)
     elif text.startswith("/help"):
@@ -822,24 +1157,57 @@ def handle_message(m: dict) -> None:
         send(chat_id, f"آیدی عددی تو: <code>{uid}</code>")
     elif text.startswith("/admin") and is_admin(uid):
         send(chat_id, "پنل ادمین ⚙️", reply_markup=admin_menu())
-    elif text.startswith("/ping") and is_admin(uid):
-        lines = []
-        for pkey, pinfo in PROVIDERS.items():
-            if not pinfo["key"]:
-                lines.append(f"❌ {pinfo['label']}: کلید تنظیم نشده")
-                continue
-            eng_p = engine(pkey)
+    elif text.startswith("/model") and is_admin(uid):
+        send(chat_id, "🧠 مدل ترجمه (مدل‌های رایگان OpenCode Zen):", reply_markup=model_menu())
+    elif text.startswith("/lang") and is_admin(uid):
+        send(chat_id, "🌐 زبان مبدأ و مقصد:", reply_markup=lang_menu())
+    elif text.startswith("/allow") and is_admin(uid):
+        parts = text.split()
+        if len(parts) == 2 and parts[1].lstrip("@").isdigit():
+            au = int(parts[1].lstrip("@"))
+            allow_user(au)
+            send(chat_id, f"✅ کاربر <code>{au}</code> مجاز شد.")
             try:
-                core.selftest(eng_p["key"], eng_p["model"], log=lambda *a: None,
-                              base_url=eng_p["base"])
-                lines.append(f"✅ {pinfo['label']} — <code>{eng_p['model']}</code> پاسخ داد")
-            except Exception as e:  # noqa: BLE001
-                lines.append(f"❌ {pinfo['label']} — {short_err(e)}")
-        send(chat_id, "🏓 وضعیت سرویس‌های ترجمه:\n" + "\n".join(lines))
+                send(au, "✅ دسترسی شما به ربات تأیید شد!\nحالا می‌توانی فایل PDF بفرستی.")
+            except TgError:
+                pass
+        else:
+            admin_pending[chat_id] = "allow"
+            send(chat_id, "آیدی عددی کاربر را بفرست (یا برای لغو بنویس: لغو)")
+    elif text.startswith("/deny") and is_admin(uid):
+        parts = text.split()
+        if len(parts) == 2 and parts[1].lstrip("@").isdigit():
+            du = int(parts[1].lstrip("@"))
+            deny_user(du)
+            send(chat_id, f"❌ دسترسی کاربر <code>{du}</code> گرفته شد.")
+        else:
+            send(chat_id, "شکل درست: <code>/deny 123456789</code>")
+    elif text.startswith("/ping") and is_admin(uid):
+        # تست واقعی سرویس ترجمه — فقط با فرمان ادمین (کلید موقتاً روشن می‌شود)
+        eng_p = engine()
+        send(chat_id, f"🏓 در حال تست OpenCode Zen با مدل <code>{eng_p['model']}</code>…")
+        try:
+            opencode_arm()
+            try:
+                outs = core.oc_translate_segments(
+                    eng_p["model"], ["Hello world.", "The sun rises in the east."],
+                    src_lang=state["config"].get("src_lang", "auto"),
+                    dst_lang=state["config"].get("dst_lang", "fa"),
+                    log=lambda *a: None, oc_bin=OC_BIN, oc_cwd=str(TMP_DIR), max_retries=1)
+                lines = [f"✅ OpenCode Zen — <code>{eng_p['model']}</code> پاسخ داد:"]
+                lines += [f"• {html_mod.escape(o)[:80]}" for o in outs]
+            finally:
+                opencode_disarm()
+        except Exception as e:  # noqa: BLE001
+            lines = [f"❌ OpenCode Zen — {short_err(e)}"]
+        mt = "✅ متصل" if mtproto_ready() else ("❌ تنظیم نشده" if not (TG_API_ID and TG_API_HASH) else "⏳ در حال اتصال…")
+        oc_key = "✅ هست" if OPENCODE_API_KEY else "❌ نیست"
+        send(chat_id, "🏓 وضعیت:\n" + "\n".join(lines) +
+             f"\n🔑 کلید OpenCode: {oc_key}\n📡 MTProto: {mt}")
     elif "document" in m:
         on_document(m)
     elif text:
-        send(chat_id, "فایل PDF انگلیسی را بفرست تا ترجمه‌اش کنم 📄\n/help برای راهنما")
+        send(chat_id, "فایل PDF را بفرست تا ترجمه‌اش کنم 📄\n/help برای راهنما")
 
 
 def handle_update(upd: dict) -> None:
@@ -896,11 +1264,15 @@ def main() -> None:
     global BOT_USERNAME
     if not BOT_TOKEN:
         sys.exit("متغیر محیطی تنظیم نشده: TELEGRAM_TOKEN")
-    if not (TT_API_KEY or GROQ_KEY):
-        sys.exit("حداقل یکی از TT_API_KEY یا GROQ_API_KEY لازم است.")
+    if not OPENCODE_API_KEY:
+        sys.exit("متغیر محیطی تنظیم نشده: OPENCODE_API_KEY")
+    if not core.find_opencode(OC_BIN):
+        sys.exit("CLI اوپن‌کد پیدا نشد (OPENCODE_BIN یا نصب opencode در workflow لازم است).")
     BOT_USERNAME = (api("getMe", timeout=20) or {}).get("username", "")
     eng = engine()
     log(f"ربات @{BOT_USERNAME} روشن شد. سرویس: {eng['label']} | مدل: {eng['model']} | ادمین: {ADMIN_ID}")
+    log(f"دسترسی‌های اولیه: {len(state['config'].get('allowed') or [])} کاربر | "
+        f"MTProto: {'فعال' if (TG_API_ID and TG_API_HASH) else 'خاموش'}")
     if RUN_MAX_MINUTES:
         log(f"حالت GitHub Actions: هر چرخه {RUN_MAX_MINUTES:.0f} دقیقه و بعد ری‌استارت زنجیره‌ای.")
     try:
@@ -912,6 +1284,14 @@ def main() -> None:
     except TgError:
         pass
     load_state()
+    # اگر مدل ذخیره‌شدهٔ قبلی از سرویس قدیمی بود، به مدل رایگان پیش‌فرض برگرد
+    with state_lock:
+        mdl = state["config"].get("model", "")
+        if not mdl or mdl in ("Top-Tools-Ai",) or mdl.startswith(("openai/", "qwen/", "llama-")):
+            state["config"]["model"] = DEFAULT_MODEL
+            dirty.set()
+
+    MT.start()  # کلاینت MTProto برای فایل‌های بزرگ (در ترد جدا)
 
     threading.Thread(target=health_server, daemon=True).start()
     threading.Thread(target=sync_loop, daemon=True).start()

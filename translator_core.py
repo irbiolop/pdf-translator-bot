@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import html as html_mod
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -32,43 +35,26 @@ import requests
 # تنظیمات سرویس و مدل
 # --------------------------------------------------------------------------
 
-# ─── سرویس‌های سازگار با OpenAI (drop-in) ───
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-TTAI_API_URL = "https://top-tools-ai.com/api/v1/chat/completions"
+# ─── سرویس ترجمه: OpenCode Zen از طریق خودِ CLI ───
+# ردهٔ رایگان Zen فقط به درخواستِ «از داخل خودِ OpenCode» جواب می‌دهد؛
+# پس ترجمه با اجرای `opencode run` انجام می‌شود (ترافیک واقعی OpenCode).
+# تابع api_translate_segments فقط برای تست با سرور موک محلی می‌ماند.
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"  # فقط مرجع تست
 
-# مدل‌های سرویس Top Tools AI (سازگار با OpenAI):
-#   • Top-Tools-Ai: ۱۰ میلیون توکن در روز، رایگان روزانه (بدون اشتراک)
-#   • بقیه: ۱۰ میلیون توکن خوش‌آمدگویی حساب جدید یا اشتراک پولی
-#   سقف‌ها: ~۴۵ درخواست/دقیقه و حداکثر ۵ درخواست همزمان (۶مین → 429)
-#   → ترجمهٔ موازی با حداکثر ۴ ورکر + فاصله‌گذار شروع درخواست‌ها امن است.
-TTAI_MODELS = [
-    "Top-Tools-Ai",          # سهمیهٔ روزانهٔ رایگان ۱۰M توکن — پیش‌فرض
-    "GLM-5.3-Flash",
-    "DeepSeek-V4-Flash",
-    "DeepSeek-V4.1-Flash",
-    "MiMo-V2.5",
-    "MiniMax-M3",
-    "GLM-5.3",
-    "Kimi-K2.6",
+# مدل‌های رایگان OpenCode Zen (پسوند -free). فهرست پویا با `opencode models`
+# خوانده می‌شود؛ این لیست فقط پشتیبانِ نبودِ CLI است.
+OPENCODE_FREE_MODELS = [
+    "deepseek-v4.1-flash-free",   # پیش‌فرض: سریع و چندزبانه
+    "glm-5.3-flash-free",
+    "minimax-m3.1-flash-free",
+    "mimo-v2.6-flash-free",
+    "longcat-2.5-preview-free",
+    "nemotron-3.5-lightning-free",
+    "nemotron-3.5-super-vl-free",
+    "beam-free",
+    "big-pickle",
 ]
-
-# مدل‌های رایگانِ مناسب Groq (فهرست قابل تغییر است؛ در رابط گرافیکی قابل ویرایش است)
-#
-# ⚠ محدودیت‌های پلن رایگان Groq (اکتبر ۲۰۲۶ — مدل‌به‌مدل، در سطح سازمان سنجیده می‌شود):
-#    حدوداً برای هر مدل چت:  ۳۰ درخواست در دقیقه | ۱٬۰۰۰ درخواست در روز
-#                            ۸٬۰۰۰ توکن در دقیقه | ۲۰۰٬۰۰۰ توکن در روز
-#    (دقیق سقف هر مدل را در console.groq.com/docs/rate-limits با حساب خودتان ببینید)
-#    توجه: مدل‌های Llama از فهرست رایگان حذف شده‌اند (فقط Enterprise)؛
-#    اگر روی کلید شما هنوز فعال است می‌توانید دستی بنویسید.
-FREE_MODELS = [
-    "openai/gpt-oss-120b",       # پیش‌فرض: بهترین کیفیت ترجمه در تیر فری فعلی
-    "openai/gpt-oss-20b",        # سریع‌تر و سبک‌تر
-    "qwen/qwen3.8-27b",          # گزینهٔ چندزبانه
-    "qwen/qwen3.6-27b",
-    "llama-3.3-70b-versatile",   # قدیمی: فقط اگر روی کلید شما هنوز فعال باشد
-    "llama-3.1-8b-instant",      # قدیمی: فقط اگر روی کلید شما هنوز فعال باشد
-]
-DEFAULT_MODEL = FREE_MODELS[0]
+DEFAULT_MODEL = OPENCODE_FREE_MODELS[0]
 
 # مکث پیش‌فرض بین صفحات در حالت پشت‌سرهم (Groq با سقف ~۸هزار توکن در دقیقه).
 # در حالت موازی (Top Tools AI) مکث معنی‌دار نیست؛ فاصله‌گذار نرخ (spacing) اعمال می‌شود.
@@ -80,6 +66,28 @@ DEFAULT_SPACING = 1.4
 
 # کمترین مقیاس مجاز برای کوچک‌شدن متن یک بلوک (زیر این حد، اندازه دیگر خوانا نیست)
 MIN_BLOCK_SCALE = 0.55
+
+# ضریب یکنواخت سایز فونت فارسی: وزیرمتن در هم‌اندازهٔ فونت‌های لاتین بزرگ‌تر دیده
+# می‌شود؛ ~۱۰٪ کوچک‌تر کردن، نتیجه را هم‌قدِ متن اصلی می‌کند (فیدبک کاربر).
+FONT_SCALE_FACTOR = 0.90
+
+# فاصلهٔ خطوط: کف بالاتر + تقویت ۱۲٪ نسبت به PDF اصلی (فارسی به فاصلهٔ بیشتری
+# نیاز دارد؛ فیدبک کاربر: «فاصله بین خطوط کمه»).
+MIN_LEADING = 1.55
+MAX_LEADING = 2.0
+
+# زبان‌های راست‌به‌چپ (برای آینه‌سازی و dir)
+RTL_LANGS = {"fa", "ar", "he", "ur", "ps", "ckb", "sd", "ug", "yi"}
+
+# نام نمایشی زبان‌ها برای پرامپت
+LANG_NAMES = {
+    "auto": "auto-detect the source language",
+    "en": "English", "fa": "Persian (Farsi)", "ar": "Arabic",
+    "fr": "French", "de": "German", "es": "Spanish", "it": "Italian",
+    "pt": "Portuguese", "tr": "Turkish", "ru": "Russian",
+    "zh": "Chinese", "ja": "Japanese", "ko": "Korean", "hi": "Hindi",
+    "ur": "Urdu",
+}
 
 APP_DIR = Path(__file__).resolve().parent
 FONTS_DIR = APP_DIR / "fonts"
@@ -99,18 +107,28 @@ FONT_URLS = {
 }
 
 # دستور سخت‌گیرانه برای مدل: ترجمهٔ کاملاً وفادار، بدون هیچ افزودن/کاستن/توضیح
-SYSTEM_PROMPT = """You are a meticulous, strictly literal English-to-Persian (Farsi) translator for books and documents.
 
-You will receive a JSON object of the form {"segments": ["...", ...]}.
-Return ONLY a JSON object of the form {"translations": ["...", ...]} with EXACTLY the same number of items, where item i is the faithful Persian translation of segment i.
+def build_system_prompt(src_lang: str = "auto", dst_lang: str = "fa") -> str:
+    """پرامپت سیستمی بر اساس زبان مبدأ و مقصد انتخابی ادمین."""
+    src = LANG_NAMES.get(src_lang, src_lang or "auto-detect the source language")
+    dst = LANG_NAMES.get(dst_lang, dst_lang or "Persian (Farsi)")
+    return f"""You are a meticulous, strictly literal document translator for books and documents.
+
+Task: translate from {src} into {dst}.
+
+You will receive a JSON object of the form {{"segments": ["...", ...]}}.
+Return ONLY a JSON object of the form {{"translations": ["...", ...]}} with EXACTLY the same number of items, where item i is the faithful translation of segment i into {dst}.
 
 Strict rules:
-1. Absolute fidelity: translate every sentence completely. Never add, omit, summarize, paraphrase, explain, or answer the content. Bring the exact sentences as they are, only in Persian.
+1. Absolute fidelity: translate every sentence completely. Never add, omit, summarize, paraphrase, explain, or answer the content. Bring the exact sentences as they are, only in {dst}.
 2. Keep the sentence order and any internal line breaks; do not merge or split items.
-3. Keep numbers, units, formulas, code, URLs, emails, and Latin proper nouns unchanged. Well-known people/places may use their common Persian spelling.
-4. Use natural, correct Persian with proper punctuation and half-space (ZWNJ) where appropriate.
+3. Keep numbers, units, formulas, code, URLs, emails, and proper nouns of the source language unchanged. Well-known people/places may use their common spelling in {dst}.
+4. Use natural, correct {dst} with proper punctuation; use half-space (ZWNJ) where appropriate if {dst} needs it.
 5. Headings, list items, captions and page numbers must be translated in the same concise style.
 6. Output only the JSON object. No explanations, no markdown, no notes."""
+
+
+SYSTEM_PROMPT = build_system_prompt("auto", "fa")
 
 # --------------------------------------------------------------------------
 # خطاها
@@ -263,9 +281,9 @@ def extract_blocks(page: "pymupdf.Page") -> list[dict]:
         # فاصلهٔ خطوط را از خود PDF اصلی تخمین می‌زنیم تا چیدمان وفادار بماند
         n_lines = max(len(line_rects), 1)
         if n_lines > 1 and size > 0:
-            leading = min(max(bbox.height / n_lines / size, 1.05), 1.8)
+            leading = min(max(bbox.height / n_lines / size * 1.12, MIN_LEADING), MAX_LEADING)
         else:
-            leading = 1.4
+            leading = MIN_LEADING
         blocks.append({
             "bbox": bbox,
             "line_rects": line_rects,
@@ -440,14 +458,16 @@ class _RateLimiter:
             time.sleep(d)
 
 
-def groq_translate_segments(api_key: str, model: str, segments: list[str], *,
+def api_translate_segments(api_key: str, model: str, segments: list[str], *,
                             temperature: float = 0.0, timeout: int = 240,
                             max_retries: int = 5, log=print,
                             base_url: str = "",
+                            src_lang: str = "auto", dst_lang: str = "fa",
                             usage_acc: dict | None = None,
                             usage_lock: threading.Lock | None = None) -> list[str]:
     """ترجمهٔ یک دسته متن با هر سرویس سازگار OpenAI (JSON mode)؛
-    خروجی هم‌طول segments است. اگر usage_acc داده شود، مصرف توکن هر پاسخ موفق
+    فقط برای تست با سرور موک محلی استفاده می‌شود (مسیر اصلی: OpenCode CLI).
+    اگر usage_acc داده شود، مصرف توکن هر پاسخ موفق
     (prompt/completion/total و تعداد درخواست) در آن جمع زده می‌شود —
     برای انحصار بین ورکرها usage_lock را هم بدهید."""
     if not segments:
@@ -460,7 +480,7 @@ def groq_translate_segments(api_key: str, model: str, segments: list[str], *,
         "max_tokens": 8192,
         "response_format": {"type": "json_object"},
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": build_system_prompt(src_lang, dst_lang)},
             {"role": "user",
              "content": json.dumps({"segments": segments}, ensure_ascii=False)},
         ],
@@ -554,15 +574,158 @@ def groq_translate_segments(api_key: str, model: str, segments: list[str], *,
     raise TranslationError(f"ترجمهٔ این بخش پس از چند تلاش ناموفق ماند: {last_err}")
 
 
-def selftest(api_key: str, model: str, log=print, base_url: str = "") -> list[str]:
+def selftest(api_key: str, model: str, log=print, base_url: str = "",
+             src_lang: str = "auto", dst_lang: str = "fa") -> list[str]:
     """تست سریع اتصال/کلید/مدل با دو جملهٔ کوتاه."""
     segs = ["Hello world.", "The sun rises in the east, and the moon watches quietly."]
-    outs = groq_translate_segments(api_key, model, segs, log=log, base_url=base_url)
+    outs = api_translate_segments(api_key, model, segs, log=log, base_url=base_url,
+                                  src_lang=src_lang, dst_lang=dst_lang)
     for s, o in zip(segs, outs):
         log(f"EN : {s}")
         log(f"FA : {o}")
     log("تست اتصال موفق بود.")
     return outs
+
+
+# --------------------------------------------------------------------------
+# ترجمه از طریق خودِ CLI اوپن‌کد (مسیر اصلی — ردهٔ رایگان Zen فقط از داخل
+# OpenCode جواب می‌دهد، پس ترجمه را `opencode run` انجام می‌دهد)
+# --------------------------------------------------------------------------
+
+
+def find_opencode(explicit: str = "") -> str:
+    """یافتن باینری opencode: پارامتر صریح > متغیر محیطی > PATH > مسیر نصب پیش‌فرض."""
+    cands = [explicit or "", os.environ.get("OPENCODE_BIN", ""), "opencode",
+             str(Path.home() / ".opencode" / "bin" / "opencode")]
+    for c in cands:
+        if not c:
+            continue
+        p = shutil.which(c)
+        if p:
+            return p
+        try:
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+        except OSError:
+            continue
+    return ""
+
+
+def _oc_parse_events(out: str) -> tuple[str, dict]:
+    """از خروجی --format json (رویدادهای خط‌به‌خط) آخرین متن پاسخ و توکن‌های
+    آخرین step_finish را برمی‌گرداند."""
+    text = ""
+    tokens: dict = {}
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if not ln or not ln.startswith("{"):
+            continue
+        try:
+            d = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        t = d.get("type")
+        part = d.get("part") or {}
+        if t == "text" and isinstance(part.get("text"), str):
+            text = part["text"]
+        elif t == "step_finish":
+            tk = part.get("tokens") or {}
+            if isinstance(tk, dict) and tk:
+                tokens = tk
+    return text, tokens
+
+
+def oc_translate_segments(model: str, segments: list[str], *,
+                          src_lang: str = "auto", dst_lang: str = "fa",
+                          timeout: int = 300, max_retries: int = 4, log=print,
+                          oc_bin: str = "opencode", oc_cwd: str | None = None,
+                          usage_acc: dict | None = None,
+                          usage_lock: threading.Lock | None = None) -> list[str]:
+    """ترجمهٔ یک دسته با اجرای `opencode run` (کلید/احراز از auth.json).
+
+    مدل باید بدون پیشوند provider باشد (مثل deepseek-v4.1-flash-free)؛
+    پیشوند opencode/ اینجا اضافه می‌شود.
+    """
+    if not segments:
+        return []
+    binpath = find_opencode(oc_bin)
+    if not binpath:
+        raise FatalTranslationError(
+            "CLI اوپن‌کد پیدا نشد؛ OPENCODE_BIN را تنظیم کنید.", code="config")
+    payload = json.dumps({"segments": segments}, ensure_ascii=False)
+    prompt = (build_system_prompt(src_lang, dst_lang)
+              + "\n\nTranslate the following JSON now and return only the JSON object:\n"
+              + payload)
+    args = [binpath, "run", "-m", f"opencode/{model}", "--pure", "--format", "json", prompt]
+    run_cwd = None
+    if oc_cwd:
+        run_cwd = str(Path(oc_cwd).resolve())
+        try:
+            Path(run_cwd).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            run_cwd = None
+    last_err: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            proc = subprocess.run(
+                args, capture_output=True, text=True, timeout=timeout,
+                cwd=run_cwd, stdin=subprocess.DEVNULL)
+            out, errout = proc.stdout or "", proc.stderr or ""
+            blob = out + "\n" + errout
+            if "FreeTierError" in blob:
+                raise FatalTranslationError(
+                    "ردهٔ رایگان OpenCode فقط از داخل خودِ OpenCode در دسترس است.",
+                    code="access")
+            if "Model not found" in blob or "model_not_found" in blob:
+                raise FatalTranslationError(
+                    f"مدل '{model}' روی OpenCode پیدا نشد؛ مدل دیگری انتخاب کنید.",
+                    code="model")
+            if "Insufficient account funds" in blob:
+                raise FatalTranslationError(
+                    "موجودی حساب OpenCode کافی نیست؛ مدل رایگان انتخاب کنید.",
+                    code="access")
+            if not out.strip():
+                raise TranslationError(
+                    f"CLI پاسخی نداد (کد {proc.returncode}): {errout.strip()[:160]}")
+            text, tokens = _oc_parse_events(out)
+            if tokens and usage_acc is not None:
+                if usage_lock is not None:
+                    usage_lock.acquire()
+                try:
+                    inp = int(tokens.get("input", 0) or 0)
+                    outp = int(tokens.get("output", 0) or 0)
+                    usage_acc["prompt_tokens"] = usage_acc.get("prompt_tokens", 0) + inp
+                    usage_acc["completion_tokens"] = usage_acc.get("completion_tokens", 0) + outp
+                    usage_acc["total_tokens"] = usage_acc.get("total_tokens", 0) + inp + outp
+                    usage_acc["api_calls"] = usage_acc.get("api_calls", 0) + 1
+                finally:
+                    if usage_lock is not None:
+                        usage_lock.release()
+            if not text.strip():
+                raise TranslationError("خروجی CLI بدون متن بود.")
+            m = re.search(r"\{.*\}", text, re.S)
+            if not m:
+                raise TranslationError("پاسخ CLI JSON نبود: " + text[:120])
+            parsed = json.loads(m.group(0))
+            trans = parsed.get("translations") if isinstance(parsed, dict) else None
+            if not isinstance(trans, list):
+                raise TranslationError("پاسخ فهرست 'translations' نداشت.")
+            if len(trans) != len(segments):
+                log(f"هشدار: طول پاسخ ({len(trans)}) با ورودی ({len(segments)}) فرق داشت؛ اصلاح شد.")
+                if len(trans) < len(segments):
+                    trans = list(trans) + list(segments[len(trans):])
+                else:
+                    trans = trans[:len(segments)]
+            return [str(t) for t in trans]
+        except FatalTranslationError:
+            raise
+        except (TranslationError, subprocess.TimeoutExpired, json.JSONDecodeError,
+                KeyError, IndexError) as e:
+            last_err = e
+            wait = min(4 * attempt, 20)
+            log(f"تلاش {attempt}/{max_retries} ناموفق بود ({e})؛ {wait} ثانیه صبر…")
+            time.sleep(wait)
+    raise TranslationError(f"ترجمهٔ این بخش پس از چند تلاش ناموفق ماند: {last_err}")
 
 
 # --------------------------------------------------------------------------
@@ -589,19 +752,24 @@ def _build_css():
 
 def _block_html(text: str, b: dict, scale: float = 1.0) -> str:
     """ساخت HTML یک بلوک با راست‌به‌چپ، اندازه، بولد/ایتالیک، رنگ و چینش.
-    scale: ضریب یکنواختِ اندازهٔ فونت (برای هم‌اندازه شدن بلوک‌های صفحه)."""
+    scale: ضریب یکنواختِ اندازهٔ فونت (برای هم‌اندازه شدن بلوک‌های صفحه).
+    جهت و چینش بر اساس زبان مقصد انتخابی ادمین تعیین می‌شود."""
     esc = html_mod.escape(text).replace("\n", "<br/>")
+    rtl = bool(b.get("_rtl", True))
+    align = b.get("align", "right")
+    if align == "right" and not rtl:
+        align = "left"  # زبان مقصد چپ‌به‌راست است
     style = [
-        f"font-size:{b['size'] * scale:.2f}px",
-        f"line-height:{b.get('leading', 1.4)}",
-        f"text-align:{b['align']}",
+        f"font-size:{b['size'] * scale * FONT_SCALE_FACTOR:.2f}px",
+        f"line-height:{b.get('leading', MIN_LEADING)}",
+        f"text-align:{align}",
         f"color:{b['color']}",
     ]
     if b.get("bold"):
         style.append("font-weight:bold")
     if b.get("italic"):
         style.append("font-style:italic")
-    return f'<div dir="rtl" style="{";".join(style)}">{esc}</div>'
+    return f'<div dir="{"rtl" if rtl else "ltr"}" style="{";".join(style)}">{esc}</div>'
 
 
 def _measure_scale(text: str, b: dict, rect: "pymupdf.Rect", css: str, arch) -> float:
@@ -660,7 +828,7 @@ def _merge_overlapping_blocks(blocks: list[dict]) -> list[dict]:
                 big["text"] = big["text"] + "\n" + small["text"]
                 n = max(len(big["line_rects"]), 1)
                 if n > 1 and big["size"] > 0:
-                    big["leading"] = min(max(u.height / n / big["size"], 1.05), 1.8)
+                    big["leading"] = min(max(u.height / n / big["size"] * 1.12, MIN_LEADING), MAX_LEADING)
                 blocks.remove(small)
                 merged_any = done = True
                 break
@@ -817,19 +985,18 @@ def _fit_rect(b: dict, rect: "pymupdf.Rect", page_rect: "pymupdf.Rect",
 
 def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=None,
                   progress=None, cancelled=None, log=print, translator=None,
-                  mirror=True, base_url="", workers=1, spacing=DEFAULT_SPACING) -> dict:
+                  mirror=True, base_url="", workers=1, spacing=DEFAULT_SPACING,
+                  src_lang="auto", dst_lang="fa", use_cli=False,
+                  oc_bin="opencode", oc_cwd=None) -> dict:
     """
-    ترجمهٔ کامل فایل PDF انگلیسی به فارسی با حفظ چیدمان.
+    ترجمهٔ کامل فایل PDF به زبان مقصد با حفظ چیدمان.
 
-    mirror: آینه‌سازی افقی چیدمان (تیتر/پاراگراف چپ‌چین انگلیسی به سمت راست صفحه می‌رود
-    و ستون‌ها جابه‌جا می‌شوند) — برای متقارن‌سازی راست‌به‌چپ.
-    base_url: نشانی chat/completions سرویس سازگار OpenAI (پیش‌فرض Groq؛
-    برای Top Tools AI مقدار TTAI_API_URL را بدهید).
-    workers: تعداد ترجمه‌های موازی. ۱ = پشت‌سرهم با مکث delay بین صفحات (مناسب Groq
-    با سقف TPM)؛ ≥۲ = بچ‌های صفحات مختلف به‌موازات هم ترجمه می‌شوند (مناسب
-    Top Tools AI با سقف RPM/همزمانی) و spacing حداقل فاصلهٔ شروع درخواست‌هاست.
-    translator: در حالت عادی None است (ترجمه با وب‌سرویس). برای تست، تابعی
-    (segments -> translations) می‌پذیرد تا بدون اینترنت هم پایپ‌لاین آزمایش شود.
+    src_lang/dst_lang: زبان مبدأ و مقصد (پیش‌فرض: خودکار → فارسی).
+    mirror: آینه‌سازی افقی چیدمان — فقط وقتی زبان مقصد راست‌به‌چپ است معنی دارد.
+    use_cli: ترجمه با اجرای CLI اوپن‌کد (مسیر اصلی سرویس Zen؛ ردهٔ رایگان فقط
+    از داخل خودِ OpenCode جواب می‌دهد). api_key در این حالت استفاده نمی‌شود.
+    workers: تعداد ترجمه‌های موازی؛ spacing حداقل فاصلهٔ شروع درخواست‌ها/فراخوانی‌ها.
+    translator: برای تست — تابعی (segments -> translations) بدون اینترنت.
     خروجی: دیکشنری آمار شامل usage (مصرف توکن ورودی/خروجی/مجموع و تعداد درخواست‌ها).
     """
     progress = progress or (lambda done, total: None)
@@ -837,6 +1004,8 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
         delay = DEFAULT_DELAY
     t0 = time.time()
     ensure_fonts(log)
+    rtl = dst_lang in RTL_LANGS
+    mirror = mirror and rtl
 
     in_path = Path(input_pdf)
     if not in_path.exists():
@@ -860,10 +1029,16 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
     _PURE_NUM_RE = re.compile(r"^[\d\s.,;:\-–—/()%#]+$")
 
     def _call_batch(batch):
-        """فراخوانی وب‌سرویس برای یک دسته؛ فاصله‌گذار نرخ بین ورکرها مشترک است."""
+        """فراخوانی سرویس ترجمه برای یک دسته؛ فاصله‌گذار نرخ بین ورکرها مشترک است."""
         limiter.wait()
-        return groq_translate_segments(
-            api_key, model, [t for _, t in batch], log=log, base_url=base_url,
+        segs_b = [t for _, t in batch]
+        if use_cli:
+            return oc_translate_segments(model, segs_b, src_lang=src_lang, dst_lang=dst_lang,
+                                         log=log, oc_bin=oc_bin, oc_cwd=oc_cwd,
+                                         usage_acc=usage, usage_lock=usage_lock)
+        return api_translate_segments(
+            api_key, model, segs_b, log=log, base_url=base_url,
+            src_lang=src_lang, dst_lang=dst_lang,
             usage_acc=usage, usage_lock=usage_lock)
 
     pool = None
@@ -894,6 +1069,9 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
             blocks = _merge_overlapping_blocks(blocks)
             # جدول‌ها: هر سلول یک بلوک مستقل تا ترجمه از خانه بیرون نزند
             blocks = _split_blocks_by_tables(page, blocks, log=log)
+            # جهت متن (راست‌چین/چپ‌چین) بر اساس زبان مقصد
+            for b in blocks:
+                b["_rtl"] = rtl
 
             segs = [b["text"] for b in blocks]
             trans = [""] * len(segs)
@@ -993,7 +1171,7 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                     scales[i] = _measure_scale(t, b, rects[i], css, arch)
             para_scales = [scales[i] for i, b in enumerate(blocks)
                            if i in scales and len(b["line_rects"]) > 1]
-            page_scale = max(min(para_scales), 0.7) if para_scales else 1.0
+            page_scale = max(min(para_scales), 0.62) if para_scales else 1.0
             page_scale = min(page_scale, 1.0)
 
             # ۴) درج ترجمهٔ فارسی
@@ -1075,6 +1253,11 @@ if __name__ == "__main__":
     ap.add_argument("--workers", type=int, default=1, help="تعداد ترجمه‌های موازی (۱ = پشت‌سرهم)")
     ap.add_argument("--no-mirror", action="store_true",
                     help="غیرفعال‌کردن آینه‌سازی افقی چیدمان")
+    ap.add_argument("--src-lang", default="auto", help="زبان مبدأ (auto یا کد زبان)")
+    ap.add_argument("--dst-lang", default="fa", help="زبان مقصد (پیش‌فرض fa)")
+    ap.add_argument("--use-cli", action="store_true",
+                    help="ترجمه با CLI اوپن‌کد به‌جای وب‌سرویس سازگار OpenAI")
+    ap.add_argument("--oc-bin", default="opencode", help="مسیر باینری opencode")
     a = ap.parse_args()
 
     _key = a.api_key or ""
@@ -1092,6 +1275,8 @@ if __name__ == "__main__":
     _out = a.output or str(Path(a.input).with_name(Path(a.input).stem + "_fa.pdf"))
     translate_pdf(a.input, _out, _key, model=a.model, delay=a.delay, mirror=not a.no_mirror,
                   base_url=a.base_url, workers=max(1, a.workers),
+                  src_lang=a.src_lang, dst_lang=a.dst_lang,
+                  use_cli=a.use_cli, oc_bin=a.oc_bin,
                   progress=lambda d, t: print(f"صفحه {d}/{t}", end="\r", flush=True),
                   log=print)
     print()
