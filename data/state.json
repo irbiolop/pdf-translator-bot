@@ -4,14 +4,17 @@
   "force_join": false,
   "channel": "",
   "speed": "fast",
-  "provider": "ttai",
-  "model": "Top-Tools-Ai"
+  "model": "deepseek-v4.1-flash-free",
+  "src_lang": "auto",
+  "dst_lang": "fa",
+  "allowed": [],
+  "provider": "ttai"
  },
  "users": {
   "7433357700": {
    "first": "2026-10-05",
-   "last": "2026-10-20 17:45",
-   "last_ts": 1792518343.8315136,
+   "last": "2026-10-20 18:06",
+   "last_ts": 1792519607.0813391,
    "username": "PrivateUssser",
    "name": "AliReza",
    "pages": 479,
