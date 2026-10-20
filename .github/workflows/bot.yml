@@ -37,11 +37,11 @@ jobs:
 
       - name: نصب OpenCode CLI (سرویس ترجمه)
         run: |
-          if ! command -v opencode >/dev/null 2>&1; then
+          if ! command -v opencode >/dev/null 2>&1 && [ ! -x "$HOME/.opencode/bin/opencode" ]; then
             curl -fsSL https://opencode.ai/install | bash
           fi
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-          opencode --version
+          "$HOME/.opencode/bin/opencode" --version
 
       - name: 🛡 جلوگیری از اجرای موازی
         id: guard
