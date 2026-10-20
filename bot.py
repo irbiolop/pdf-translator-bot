@@ -1126,6 +1126,7 @@ def process_job(job: dict) -> None:
         in_pdf.unlink(missing_ok=True)
         return
     except Exception as e:  # noqa: BLE001
+        traceback.print_exc()  # استک کامل در لاگ Actions برای دیباگ
         edit(chat, stid, f"❌ خطای غیرمنتظره در ترجمه: <code>{html_mod.escape(str(e))[:140]}</code>")
         in_pdf.unlink(missing_ok=True)
         return

@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -410,7 +411,9 @@ def _split_blocks_by_tables(page: "pymupdf.Page", blocks: list[dict],
         resid = [li for li in range(len(b["line_rects"])) if (bi, li) not in consumed_pairs]
         if resid:
             lrs = [b["line_rects"][li] for li in resid]
-            raws = [b["raw_lines"][li] for li in resid]
+            # گارد: اگر raw_lines به هر دلیلی کوتاه‌تر بود (بلوک‌های ادغام‌شدهٔ قدیمی)،
+            # به‌جای IndexError خط بدون متنِ شناخته‌شده رد شود.
+            raws = [b["raw_lines"][li] if li < len(b["raw_lines"]) else "" for li in resid]
             nb = dict(b)
             nb["line_rects"] = lrs
             nb["raw_lines"] = raws
@@ -825,6 +828,9 @@ def _merge_overlapping_blocks(blocks: list[dict]) -> list[dict]:
                 u.include_rect(small["bbox"])
                 big["bbox"] = u
                 big["line_rects"] = big["line_rects"] + small["line_rects"]
+                # raw_lines باید هم‌طولِ line_rects بماند؛ ناهم‌خوانی‌اش بعداً
+                # در تفکیک جدول‌ها IndexError «list index out of range» می‌دهد.
+                big["raw_lines"] = big.get("raw_lines", []) + small.get("raw_lines", [])
                 big["text"] = big["text"] + "\n" + small["text"]
                 n = max(len(big["line_rects"]), 1)
                 if n > 1 and big["size"] > 0:
@@ -1110,93 +1116,109 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                 continue
 
             page = doc[pno]
-            for batch, fut in tasks:
-                try:
-                    outs = fut.result() if fut is not None else _call_batch(batch)
-                except FatalTranslationError:
-                    raise
-                except TranslationError as e:
-                    stats["failed_pages"].append(pno + 1)
-                    log(f"صفحهٔ {pno + 1}: {e} — متن اصلیِ این بخش حفظ شد.")
-                    outs = None
-                if outs is not None:
-                    for (idx, _), tr in zip(batch, outs):
-                        trans[idx] = tr
+            # کل بازسازی صفحه در برابر خطاهای غیرمنتظره مقاوم شده تا یک صفحهٔ ناساز
+            # هیچ‌وقت فایل چندصفحه‌ای (تا ۲۰۰۰ صفحه) را نیمه‌کاره نکشد.
+            try:
+                for batch, fut in tasks:
+                    try:
+                        outs = fut.result() if fut is not None else _call_batch(batch)
+                    except FatalTranslationError:
+                        raise
+                    except TranslationError as e:
+                        stats["failed_pages"].append(pno + 1)
+                        log(f"صفحهٔ {pno + 1}: {e} — متن اصلیِ این بخش حفظ شد.")
+                        outs = None
+                    except Exception as e:  # noqa: BLE001
+                        stats["failed_pages"].append(pno + 1)
+                        log(f"صفحهٔ {pno + 1}: خطای غیرمنتظره در ترجمهٔ بخش ({e}) — متن اصلی حفظ شد.")
+                        log(traceback.format_exc())
+                        outs = None
+                    if outs is not None:
+                        for (idx, _), tr in zip(batch, outs):
+                            trans[idx] = tr
 
-            # ۱) حذف متن اصلی صفحه (تصاویر و گرافیک دست‌نخورده می‌مانند)
-            for b in blocks:
-                for r in b["line_rects"]:
-                    pr = pymupdf.Rect(r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 0.5)
-                    page.add_redact_annot(pr, fill=False)
-            _apply_redactions(page)
+                # ۱) حذف متن اصلی صفحه (تصاویر و گرافیک دست‌نخورده می‌مانند)
+                for b in blocks:
+                    for r in b["line_rects"]:
+                        pr = pymupdf.Rect(r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 0.5)
+                        page.add_redact_annot(pr, fill=False)
+                _apply_redactions(page)
 
-            # ۲) کادرهای هدف: با آینه‌سازی افقی، متن چپ‌چین انگلیسی به موقعیت متقارنِ راست می‌رود
-            page_w = page.rect.width
-            rects = []
-            for b in blocks:
-                r = b["bbox"]
-                if mirror:
-                    r = _mirror_rect(b["bbox"], page_w)
-                rects.append(r)
+                # ۲) کادرهای هدف: با آینه‌سازی افقی، متن چپ‌چین انگلیسی به موقعیت متقارنِ راست می‌رود
+                page_w = page.rect.width
+                rects = []
+                for b in blocks:
+                    r = b["bbox"]
+                    if mirror:
+                        r = _mirror_rect(b["bbox"], page_w)
+                    rects.append(r)
 
-            # ۲٫۵) آینه‌سازی محتوای گرافیکی: جدول‌ها/کادرها/خطوط با متن هم‌تراز می‌شوند و
-            #      تصاویر به موقعیت آینه‌ای منتقل می‌شوند (بدون برعکس‌شدن محتوای خودشان)
-            if mirror and _page_flippable(page):
-                try:
-                    imgs = _collect_images(page)
-                    if imgs:
-                        # حذف استقرار فعلی (با مختصات اصلی، قبل از فلیپ)
-                        _remove_images(page, [im["bbox"] for im in imgs])
-                    # فلیپ فقط ترسیم‌های برداری باقی‌مانده را آینه می‌کند
-                    _flip_page_graphics(doc, page)
-                    # بازدرج تصاویر بعد از فلیپ → زیر ماتریس آینه نمی‌روند
-                    _reinsert_images(doc, page, imgs, page_w, log=log)
-                except Exception as e:  # noqa: BLE001
-                    log(f"صفحهٔ {pno + 1}: آینه‌سازی گرافیک ناموفق بود: {e}")
-                # لینک‌ها هم به موقعیت آینه‌ای می‌روند
-                try:
-                    for lnk in page.get_links():
-                        fr = lnk.get("from")
-                        if fr is not None:
-                            lnk["from"] = _mirror_rect(fr, page_w)
-                            page.update_link(lnk)
-                except Exception:  # noqa: BLE001
-                    pass
+                # ۲٫۵) آینه‌سازی محتوای گرافیکی: جدول‌ها/کادرها/خطوط با متن هم‌تراز می‌شوند و
+                #      تصاویر به موقعیت آینه‌ای منتقل می‌شوند (بدون برعکس‌شدن محتوای خودشان)
+                if mirror and _page_flippable(page):
+                    try:
+                        imgs = _collect_images(page)
+                        if imgs:
+                            # حذف استقرار فعلی (با مختصات اصلی، قبل از فلیپ)
+                            _remove_images(page, [im["bbox"] for im in imgs])
+                        # فلیپ فقط ترسیم‌های برداری باقی‌مانده را آینه می‌کند
+                        _flip_page_graphics(doc, page)
+                        # بازدرج تصاویر بعد از فلیپ → زیر ماتریس آینه نمی‌روند
+                        _reinsert_images(doc, page, imgs, page_w, log=log)
+                    except Exception as e:  # noqa: BLE001
+                        log(f"صفحهٔ {pno + 1}: آینه‌سازی گرافیک ناموفق بود: {e}")
+                    # لینک‌ها هم به موقعیت آینه‌ای می‌روند
+                    try:
+                        for lnk in page.get_links():
+                            fr = lnk.get("from")
+                            if fr is not None:
+                                lnk["from"] = _mirror_rect(fr, page_w)
+                                page.update_link(lnk)
+                    except Exception:  # noqa: BLE001
+                        pass
 
-            # ۳) مقیاس یکنواخت صفحه: کمترین مقیاسی که همهٔ پاراگراف‌ها جا شوند؛
-            #    همهٔ بلوک‌ها با همان ضریب کوچک می‌شوند تا اندازه‌ها یکنواخت بماند
-            scales = {}
-            for i, (b, t) in enumerate(zip(blocks, trans)):
-                if (t or "").strip():
-                    scales[i] = _measure_scale(t, b, rects[i], css, arch)
-            para_scales = [scales[i] for i, b in enumerate(blocks)
-                           if i in scales and len(b["line_rects"]) > 1]
-            page_scale = max(min(para_scales), 0.62) if para_scales else 1.0
-            page_scale = min(page_scale, 1.0)
+                # ۳) مقیاس یکنواخت صفحه: کمترین مقیاسی که همهٔ پاراگراف‌ها جا شوند؛
+                #    همهٔ بلوک‌ها با همان ضریب کوچک می‌شوند تا اندازه‌ها یکنواخت بماند
+                scales = {}
+                for i, (b, t) in enumerate(zip(blocks, trans)):
+                    if (t or "").strip():
+                        scales[i] = _measure_scale(t, b, rects[i], css, arch)
+                para_scales = [scales[i] for i, b in enumerate(blocks)
+                               if i in scales and len(b["line_rects"]) > 1]
+                page_scale = max(min(para_scales), 0.62) if para_scales else 1.0
+                page_scale = min(page_scale, 1.0)
 
-            # ۴) درج ترجمهٔ فارسی
-            for i, (b, t) in enumerate(zip(blocks, trans)):
-                t = (t or "").strip()
-                if not t:
-                    continue
-                s_own = scales.get(i, 1.0)
-                use = page_scale if s_own >= page_scale else s_own
-                if s_own < page_scale:
-                    log(f"صفحهٔ {pno + 1}: یک بلوک با مقیاس {int(s_own * 100)}٪ درج شد "
-                        f"(در مقیاس یکنواختِ {int(page_scale * 100)}٪ جا نشد).")
-                rect = _fit_rect(b, rects[i], page.rect,
-                                 siblings=[rects[j] for j in range(len(rects)) if j != i])
-                if rect.is_empty or rect.width <= 2 or rect.height <= 2:
-                    continue
-                try:
-                    _spare, shrink = page.insert_htmlbox(
-                        rect, _block_html(t, b, use), css=css, archive=arch)
-                    if shrink and shrink < 0.85:
-                        log(f"صفحهٔ {pno + 1}: یک بلوک برای جا شدن به {int(shrink * 100)}٪ کوچک شد.")
-                except Exception as e:  # noqa: BLE001
-                    log(f"صفحهٔ {pno + 1}: درج متن ناموفق بود: {e}")
+                # ۴) درج ترجمهٔ فارسی
+                for i, (b, t) in enumerate(zip(blocks, trans)):
+                    t = (t or "").strip()
+                    if not t:
+                        continue
+                    s_own = scales.get(i, 1.0)
+                    use = page_scale if s_own >= page_scale else s_own
+                    if s_own < page_scale:
+                        log(f"صفحهٔ {pno + 1}: یک بلوک با مقیاس {int(s_own * 100)}٪ درج شد "
+                            f"(در مقیاس یکنواختِ {int(page_scale * 100)}٪ جا نشد).")
+                    rect = _fit_rect(b, rects[i], page.rect,
+                                     siblings=[rects[j] for j in range(len(rects)) if j != i])
+                    if rect.is_empty or rect.width <= 2 or rect.height <= 2:
+                        continue
+                    try:
+                        _spare, shrink = page.insert_htmlbox(
+                            rect, _block_html(t, b, use), css=css, archive=arch)
+                        if shrink and shrink < 0.85:
+                            log(f"صفحهٔ {pno + 1}: یک بلوک برای جا شدن به {int(shrink * 100)}٪ کوچک شد.")
+                    except Exception as e:  # noqa: BLE001
+                        log(f"صفحهٔ {pno + 1}: درج متن ناموفق بود: {e}")
 
-            stats["translated"] += 1
+                stats["translated"] += 1
+            except FatalTranslationError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                # صفحهٔ مشکل‌دار رد می‌شود (متن اصلی می‌ماند) ولی ادامهٔ فایل زنده می‌ماند
+                stats["failed_pages"].append(pno + 1)
+                log(f"صفحهٔ {pno + 1}: خطای غیرمنتظره در بازسازی ({e}) — "
+                    "این صفحه بدون ترجمه کپی می‌شود؛ ادامهٔ فایل زنده است.")
+                log(traceback.format_exc())
             progress(pno + 1, total)
 
             # ذخیرهٔ موقت هر ۲۵ صفحه (برای جلوگیری از از دست رفتن پیشرفت)
