@@ -7,7 +7,9 @@
   "model": "deepseek-v4.1-flash-free",
   "src_lang": "auto",
   "dst_lang": "fa",
-  "allowed": [],
+  "allowed": [
+   8748914497
+  ],
   "provider": "ttai"
  },
  "users": {
@@ -28,6 +30,11 @@
    "first": "2026-10-17",
    "last": "2026-10-17 21:32",
    "last_ts": 1792272754.2046707
+  },
+  "8748914497": {
+   "first": "2026-10-21",
+   "last": "2026-10-21 00:07",
+   "last_ts": 1792541263.5763633
   }
  },
  "totals": {
