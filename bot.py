@@ -1858,9 +1858,9 @@ def handle_message(m: dict) -> None:
         if uid in auth_requested:
             send(chat_id, "درخواست شما قبلاً ثبت شده؛ منتظر تأیید ادمین باش.")
         return
-    # ── پاسخ کاربر به سوال «بازهٔ صفحه» (متن آزاد)
+    # ── پاسخ کاربر به سوال «بازهٔ صفحه» (متن آزاد؛ دستورها رد نمی‌شوند)
     _rev = range_replies.get(uid)
-    if _rev is not None and not _rev.is_set():
+    if _rev is not None and not _rev.is_set() and text and not text.startswith("/"):
         range_values[uid] = text
         _rev.set()
         return
