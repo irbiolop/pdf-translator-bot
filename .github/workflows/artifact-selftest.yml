@@ -1,0 +1,53 @@
+name: Artifact selftest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Round-trip test
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          import json, os, time
+          from pathlib import Path
+          import gh_store
+
+          repo = os.environ["GITHUB_REPO"]
+          tok = os.environ["GITHUB_TOKEN"]
+          run_id = int(os.environ.get("GITHUB_RUN_ID", "0") or 0)
+          name = f"cp-selftest-{int(time.time())}"
+          src = Path("data/cp/selftest"); src.mkdir(parents=True, exist_ok=True)
+          (src / "meta.json").write_text(json.dumps({"hello": "checkpoint", "ts": time.time()}), encoding="utf-8")
+          (src / "blob.bin").write_bytes(os.urandom(3_000_000))
+
+          ref = gh_store.upload_checkpoint(repo, tok, run_id, name,
+                  {"meta.json": src / "meta.json", "blob.bin": src / "blob.bin"})
+          print("REF =", ref)
+          assert ref, "upload failed"
+
+          dst = Path("data/cp/restored")
+          ok = gh_store.download_checkpoint(repo, tok, ref, dst)
+          print("DOWNLOAD OK =", ok)
+          assert ok
+          a = (src / "blob.bin").read_bytes(); b = (dst / "blob.bin").read_bytes()
+          print("SIZE match:", len(a) == len(b), "| BYTES match:", a == b)
+          assert a == b
+
+          gh_store.cleanup_checkpoint(repo, tok, ref)
+          print("SELFTEST PASSED ✅")
+          PY

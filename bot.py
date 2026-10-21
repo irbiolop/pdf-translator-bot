@@ -20,6 +20,8 @@ import html as html_mod
 import json
 import os
 import queue
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -31,6 +33,7 @@ from pathlib import Path
 import pymupdf
 import requests
 
+import gh_store
 import translator_core as core
 
 # --------------------------------------------------------------------------
@@ -74,10 +77,11 @@ STATE_REPO_PATH = "data/state.json"
 TMP_DIR = Path("data/tmp")
 
 # سرعت ترجمه: (تعداد فراخوانی همزمانِ opencode، فاصلهٔ شروع فراخوانی‌ها به ثانیه)
-# محافظه‌کارانه تا الگوی مصرف شبیه استفادهٔ عادی از OpenCode بماند (ضد بن).
-SPEEDS_OC = {"fast": (3, 2.5), "balanced": (2, 4.0), "safe": (1, 8.0)}
-SPEED_LABELS_OC = {"fast": "موازی ×۳ — سریع‌ترین", "balanced": "موازی ×۲ — متعادل",
-                   "safe": "تک‌کار‌کره — محتاط"}
+# موازی‌سازی فقط «زمان انتظار» را پنهان می‌کند؛ فاصله‌گذارِ نرخ مشترک است و
+# الگوی مصرف در سقف RPM معقول می‌ماند (ضد بن).
+SPEEDS_OC = {"fast": (6, 1.5), "balanced": (4, 2.5), "safe": (2, 6.0)}
+SPEED_LABELS_OC = {"fast": "موازی ×۶ — سریع‌ترین", "balanced": "موازی ×۴ — متعادل",
+                   "safe": "موازی ×۲ — محتاط"}
 SPEED_ORDER = ["fast", "balanced", "safe"]
 
 
@@ -126,10 +130,19 @@ def alert_admin_provider_down(label: str, err: Exception) -> None:
 MAX_DOWNLOAD = 19 * 1024 * 1024   # سقف دانلود مستقیم Bot API تلگرام
 MAX_MTPROTO = 1900 * 1024 * 1024  # سقف منطقی فایل با MTProto (~۲GB تلگرام)
 MAX_QUEUE = 6                     # حداکثر فایل در صف
-# تخمین زمان ترجمه برای فایل‌های خیلی بزرگ (ثانیه به‌ازای هر صفحه؛ شامل پردازش PDF).
-# اگر فایل تا سقف سخت جاب جا نشود، به‌جای کشته‌شدن وسط کار، با پیام راهنما رد می‌شود.
-SEC_PER_PAGE_EST = float(os.environ.get("SEC_PER_PAGE_EST", "7.5") or 7.5)
+# تخمین زمان ترجمه به‌ازای هر صفحه (ثانیه؛ شامل استخراج و بازسازی PDF).
+# فقط برای هشدار زمانی استفاده می‌شود؛ با چک‌پوینت، فایل‌های بزرگ دیگر رد نمی‌شوند.
+SEC_PER_PAGE_EST = float(os.environ.get("SEC_PER_PAGE_EST", "4.0") or 4.0)
 JOB_HARD_MINUTES = float(os.environ.get("JOB_HARD_MINUTES", "345") or 345)  # سقف timeout-minutes ورک‌فلو منهای حاشیه
+# مهلت «تخلیهٔ طبیعی» در پایان چرخه؛ بعد از آن کارِ در جریان توقف موقت و چک‌پوینت می‌شود
+DRAIN_GRACE_MINUTES = float(os.environ.get("DRAIN_GRACE_MINUTES", "45") or 45)
+# از این تعداد صفحه به بالا، قبل از ترجمه پرسیده می‌شود: کل فایل یا بازهٔ صفحه‌ای؟
+RANGE_ASK_MIN = int(os.environ.get("RANGE_ASK_MIN", "15") or 15)
+# مهلت پاسخ به سوال انتخاب بازه (ثانیه)؛ بی‌پاسخ = کل فایل
+RANGE_WAIT_SEC = int(os.environ.get("RANGE_WAIT_SEC", "480") or 480)
+RUN_ID = int(os.environ.get("GITHUB_RUN_ID", "0") or 0)   # برای آپلود artifact چک‌پوینت
+CP_DIR = Path("data/cp")
+MIN_CYCLE_LEFT_MIN = 10.0  # اگر کمتر از این تا پایان چرخه مانده، کار تازه صفِ چرخهٔ بعد می‌شود
 
 state_lock = threading.RLock()
 dirty = threading.Event()
@@ -139,9 +152,16 @@ auth_requested: set[int] = set()   # کاربرانی که برایشان درخ
 admin_pending: dict[int, str] = {}   # chat_id -> نوع ورودی منتظره (limit/channel/allow)
 worker_busy = threading.Event()
 draining = threading.Event()      # چرخه در حال بسته‌شدن است؛ فایل جدید پذیرفته نمی‌شود
+job_pause = threading.Event()     # درخواست توقف موقت کارِ در جریان (چک‌پوینت گرفته می‌شود)
 start_ts = time.time()
 stop_event = threading.Event()
 BOT_USERNAME = ""
+
+# کارهای فعالِ همین چرخه: jobkey → اطلاعات برای دکمه‌های توقف/دریافت/ادامه
+active_jobs: dict[str, dict] = {}
+# پاسخ کاربر به سوال «کل فایل یا بازه؟»: uid → Event (و متن پاسخ)
+range_replies: dict[int, threading.Event] = {}
+range_values: dict[int, str] = {}
 
 
 def log(*args) -> None:
@@ -162,6 +182,7 @@ def _default_state() -> dict:
         },
         "users": {},
         "totals": {"files": 0, "pages": 0},
+        "jobs": {},   # کارهای معلق/چک‌پوینت‌شده برای ادامه در چرخهٔ بعد
     }
 
 
@@ -191,7 +212,9 @@ def load_state() -> None:
                 state["config"] = {**dflt["config"], **data.get("config", {})}
                 state["users"] = data.get("users", {})
                 state["totals"] = {**dflt["totals"], **data.get("totals", {})}
-            log(f"وضعیت از GitHub بازیابی شد ({len(state['users'])} کاربر).")
+                state["jobs"] = data.get("jobs", {})
+            log(f"وضعیت از GitHub بازیابی شد ({len(state['users'])} کاربر، "
+                f"{len(state['jobs'])} کارِ معلق).")
         else:
             log("وضعیت ذخیره‌شده‌ای در GitHub نبود؛ شروع تازه.")
     except Exception as e:  # noqa: BLE001
@@ -245,6 +268,225 @@ def sync_loop() -> None:
             log(f"همگام‌سازی ناموفق: {e}")
             dirty.set()
             time.sleep(60)
+
+
+# --------------------------------------------------------------------------
+# چک‌پوینت، بازهٔ صفحه و تحویل فایل
+# --------------------------------------------------------------------------
+_FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def cp_dir(jobkey: str) -> Path:
+    return CP_DIR / jobkey
+
+
+def parse_range(txt: str, n_pages: int) -> tuple[int, int] | None:
+    """«۱۰-۵۰» / «10 تا 50» / «from 10 to 50» → بازهٔ ۱مبنا (شروع، پایان)؛ نامعتبر = None."""
+    t = (txt or "").strip().translate(_FA_DIGITS).lower()
+    t = t.replace("از", " ").replace("تا", " ").replace("to", " ").replace("from", " ")
+    m = re.search(r"(\d{1,5})\D{1,6}(\d{1,5})", t)
+    if m:
+        s, e = int(m.group(1)), int(m.group(2))
+    else:
+        m = re.search(r"(\d{1,5})", t)
+        if not m:
+            return None
+        s, e = int(m.group(1)), n_pages  # فقط شروع ← تا پایان فایل
+    if s > e:
+        s, e = e, s
+    s, e = max(1, s), min(n_pages, e)
+    if s > e:
+        return None
+    return s, e
+
+
+def _fmt_pages(s: int, e: int) -> str:
+    return f"{s:,}" if s == e else f"{s:,} تا {e:,}"
+
+
+def job_progress_kb(jobkey: str) -> dict:
+    return {"inline_keyboard": [[
+        {"text": "⏸ توقف موقت", "callback_data": f"jb:pause:{jobkey}"},
+        {"text": "📥 دریافت تا اینجا", "callback_data": f"jb:part:{jobkey}"},
+    ]]}
+
+
+def paused_kb(jobkey: str, done: int) -> dict:
+    return {"inline_keyboard": [[
+        {"text": f"▶️ ادامه از صفحهٔ {done + 1:,}", "callback_data": f"jb:resume:{jobkey}"},
+        {"text": "📥 دریافت بخش ترجمه‌شده", "callback_data": f"jb:part:{jobkey}"},
+    ]]}
+
+
+def ask_range_kb(jobkey: str) -> dict:
+    return {"inline_keyboard": [[
+        {"text": "📖 کل فایل", "callback_data": f"rng:all:{jobkey}"},
+        {"text": "✂️ از صفحه … تا صفحه …", "callback_data": f"rng:part:{jobkey}"},
+    ]]}
+
+
+def deliver_file(chat: int, path: Path, caption: str) -> bool:
+    """ارسال فایل خروجی: ≤۴۹.۵MB با Bot API؛ بزرگ‌تر با MTProto."""
+    mb = path.stat().st_size / (1024 * 1024)
+    if mb <= 49.5:
+        try:
+            upload_document(chat, path, caption)
+            return True
+        except TgError as e:
+            log(f"آپلود Bot API ناموفق بود؛ تلاش با MTProto: {e}")
+    if mtproto_ready():
+        return MT.upload(chat, path, caption)
+    return False
+
+
+def merge_partials(old_partial: Path | None, new_part: Path, split_at: int,
+                   out_path: Path) -> Path:
+    """ادغام پیشرفت قبلی و بخش تازه: صفحات [۰, split_at) از فایل قبلی + بقیه از فایل تازه.
+    (split_at = ۰ یعنی کل خروجی همان فایل تازه است.)"""
+    if not old_partial or split_at <= 0 or not Path(old_partial).exists():
+        return Path(new_part)
+    with pymupdf.open(str(new_part)) as nd:
+        n = nd.page_count
+    if split_at >= n:  # همهٔ صفحات از قبل ترجمه‌شده‌اند؛ همان فایل قبلی کافی است
+        shutil.copyfile(old_partial, out_path)
+        return out_path
+    fin = pymupdf.open()
+    try:
+        with pymupdf.open(str(old_partial)) as od:
+            fin.insert_pdf(od, from_page=0, to_page=min(split_at, od.page_count) - 1)
+        fin.insert_pdf(nd, from_page=split_at, to_page=n - 1)
+        fin.save(str(out_path), garbage=3, deflate=True)
+    finally:
+        fin.close()
+    return out_path
+
+
+def save_job_record(jobkey: str, **fields) -> None:
+    with state_lock:
+        rec = state["jobs"].setdefault(jobkey, {})
+        rec.update(fields)
+        rec["ts"] = time.time()
+    dirty.set()
+
+
+def get_job_record(jobkey: str) -> dict:
+    with state_lock:
+        return dict(state["jobs"].get(jobkey) or {})
+
+
+def drop_job_record(jobkey: str) -> None:
+    with state_lock:
+        state["jobs"].pop(jobkey, None)
+    dirty.set()
+
+
+def save_checkpoint(jobkey: str, rec: dict, in_pdf: Path, partial: Path,
+                    done_pages: int) -> str:
+    """چک‌پوینت (PDF ورودی + خروجی ناتمام + متادیتا) را آپلود و مرجعش را برمی‌گرداند."""
+    d = cp_dir(jobkey)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        if in_pdf.exists() and in_pdf != d / "in.pdf":
+            shutil.move(str(in_pdf), str(d / "in.pdf"))
+        if partial.exists() and partial != d / "partial.pdf":
+            shutil.move(str(partial), str(d / "partial.pdf"))
+        (d / "meta.json").write_text(json.dumps({
+            "jobkey": jobkey, "done_pages": done_pages, "ts": time.time(),
+            **{k: rec.get(k) for k in ("name", "pages_total", "range_s", "range_e",
+                                       "uid", "chat", "size")},
+        }, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        log(f"آماده‌سازی چک‌پوینت ناموفق بود: {e}")
+        return ""
+    old_ref = rec.get("cp_ref") or ""
+    ref = ""
+    if GH_TOKEN and GH_REPO:
+        ref = gh_store.upload_checkpoint(
+            GH_REPO, GH_TOKEN, RUN_ID, f"cp-{jobkey}",
+            {"in.pdf": d / "in.pdf", "partial.pdf": d / "partial.pdf",
+             "meta.json": d / "meta.json"},
+            branch=GH_BRANCH, workdir=TMP_DIR, log=log)
+    if old_ref and old_ref != ref:
+        gh_store.cleanup_checkpoint(GH_REPO, GH_TOKEN, old_ref)
+    save_job_record(jobkey, status="paused", done_pages=done_pages,
+                    cp_ref=ref, cp_local=bool(ref) or (d / "in.pdf").exists())
+    return ref
+
+
+def boot_resume() -> None:
+    """چک‌پوینت‌ها و کارهای معلق چرخهٔ قبل را بازیابی و دوباره صف می‌کند."""
+    with state_lock:
+        jobs = dict(state.get("jobs") or {})
+    if not jobs:
+        return
+    now = time.time()
+    n_q = n_r = 0
+    for key, rec in sorted(jobs.items(), key=lambda kv: (kv[1].get("ts") or 0)):
+        st = rec.get("status")
+        if st not in ("queued", "paused", "failed_cycle", "resuming"):
+            drop_job_record(key)
+            continue
+        if now - (rec.get("ts") or 0) > 14 * 86400:  # چک‌پوینت کهنه
+            drop_job_record(key)
+            gh_store.cleanup_checkpoint(GH_REPO, GH_TOKEN, rec.get("cp_ref") or "")
+            continue
+        if st == "queued":
+            job = {k: v for k, v in rec.items()
+                   if k in ("chat", "uid", "file_id", "mid", "size", "name",
+                            "uname", "asked")}
+            job["jobkey"] = key
+            if rec.get("range_e"):
+                job["range"] = (int(rec.get("range_s") or 1), int(rec["range_e"]))
+            job_q.put(job)
+            n_q += 1
+            continue
+        # paused / failed_cycle → چک‌پوینت بیاور
+        d = cp_dir(key)
+        ok = (d / "in.pdf").exists() and (d / "partial.pdf").exists()
+        if not ok and rec.get("cp_ref") and GH_TOKEN and GH_REPO:
+            ok = gh_store.download_checkpoint(GH_REPO, GH_TOKEN, rec["cp_ref"], d,
+                                              log=log)
+        if not ok:
+            log(f"چک‌پوینت «{rec.get('name')}» بازیابی نشد؛ به کاربر خبر می‌دهم.")
+            drop_job_record(key)
+            try:
+                send(rec.get("chat"), f"⚠️ ادامهٔ ترجمهٔ «{html_mod.escape(str(rec.get('name') or 'فایل'))}» "
+                                      "ممکن نشد (چک‌پوینت در دسترس نبود). لطفاً فایل را دوباره بفرست.")
+            except TgError:
+                pass
+            continue
+        job_q.put({"resume": key})
+        n_r += 1
+    if n_q or n_r:
+        log(f"ادامهٔ کارهای چرخهٔ قبل: {n_q} کار در صف + {n_r} چک‌پوینت بازیابی شد.")
+        try:
+            commit_state("boot-resume")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def snapshot_queues_to_state() -> None:
+    """در پایان چرخه: کارهای صف‌نشسته را برای چرخهٔ بعد در state ذخیره کن."""
+    moved = 0
+    while True:
+        try:
+            job = job_q.get_nowait()
+        except queue.Empty:
+            break
+        job_q.task_done()
+        if job.get("resume"):
+            save_job_record(job["resume"], status="paused")  # چک‌پوینت هنوز معتبر است
+            moved += 1
+            continue
+        key = job.get("jobkey") or f"{job.get('uid')}_{int(time.time())}_{moved}"
+        save_job_record(key, status="queued", chat=job.get("chat"),
+                        uid=job.get("uid"), file_id=job.get("file_id"),
+                        mid=job.get("mid"), size=job.get("size"),
+                        name=job.get("name"), uname=job.get("uname"),
+                        range=job.get("range"), asked=job.get("asked"))
+        moved += 1
+    if moved:
+        log(f"{moved} کارِ صف‌نشده برای چرخهٔ بعد ذخیره شد.")
 
 
 # --------------------------------------------------------------------------
@@ -688,6 +930,7 @@ def stats_text() -> str:
             f"📚 فایل‌های ترجمه‌شده: {totals.get('files', 0)}",
             f"📄 صفحه‌های ترجمه‌شده: {totals.get('pages', 0)}",
             f"⏳ صف فعلی: {job_q.qsize()}",
+            f"💾 چک‌پوینت‌های معلق: {sum(1 for j in (state.get('jobs') or {}).values() if j.get('status') == 'paused')}",
             f"⚡ سرعت: {speed_label(cfg.get('speed'))}",
             f"🤖 سرویس: OpenCode Zen — <code>{cfg.get('model')}</code>",
             f"🌐 زبان: {cfg.get('src_lang', 'auto')} → {cfg.get('dst_lang', 'fa')}",
@@ -771,6 +1014,57 @@ def lang_menu() -> dict:
     return {"inline_keyboard": rows}
 
 
+def handle_send_partial(chat: int, jkey: str, aj: dict, rec: dict) -> None:
+    """دکمهٔ «دریافت تا اینجا»: آخرین snapshot ذخیره‌شده را می‌فرستد (بدون توقف ترجمه)."""
+    def _do() -> None:
+        cands = []
+        if aj.get("part_pdf") and Path(aj["part_pdf"]).exists():
+            cands.append(Path(aj["part_pdf"]))
+        d = cp_dir(jkey)
+        if (d / "partial.pdf").exists():
+            cands.append(d / "partial.pdf")
+        src = cands[0] if cands else None
+        if src is None:
+            try:
+                send(chat, "⏳ هنوز ذخیرهٔ میانگیری انجام نشده (هر ۲۵ صفحه یک‌بار ذخیره می‌شود)؛ "
+                           "چند دقیقهٔ دیگر دوباره بزن.")
+            except TgError:
+                pass
+            return
+        snap = TMP_DIR / f"snap_{jkey}.pdf"
+        try:
+            shutil.copyfile(src, snap)
+            try:  # اعتبارسنجی: کپی وسط نوشتن می‌تواند ناقص باشد
+                with pymupdf.open(str(snap)) as _chk:
+                    _chk.page_count
+            except Exception:
+                snap.unlink(missing_ok=True)
+                try:
+                    send(chat, "⏳ همین لحظه در حال ذخیرهٔ میانگیری بودم؛ چند ثانیهٔ دیگر دوباره بزن.")
+                except TgError:
+                    pass
+                return
+            done = aj.get("last_done") or rec.get("done_pages") or 0
+            cap = (f"📥 بخش ترجمه‌شدهٔ «{html_mod.escape(str(aj.get('name') or rec.get('name') or 'فایل'))}» — "
+                   f"تا صفحهٔ {done:,} (بقیهٔ صفحات در فایل به‌صورت متن اصلی مانده)")
+            if deliver_file(chat, snap, cap):
+                try:
+                    send(chat, "ℹ️ این نسخهٔ میانی است؛ نسخهٔ کامل بعد از پایان ترجمه ارسال می‌شود.")
+                except TgError:
+                    pass
+            else:
+                send(chat, "❌ ارسال فایل ناموفق بود؛ دوباره امتحان کن.")
+        except Exception as e:  # noqa: BLE001
+            log(f"ارسال بخش میانی ناموفق بود: {e}")
+            try:
+                send(chat, "❌ ارسال بخش میانی ناموفق بود؛ چند لحظهٔ دیگر دوباره بزن.")
+            except TgError:
+                pass
+        finally:
+            snap.unlink(missing_ok=True)
+    threading.Thread(target=_do, daemon=True, name="partial-send").start()
+
+
 def handle_callback(cb: dict) -> None:
     data = cb.get("data", "")
     uid = cb.get("from", {}).get("id")
@@ -783,6 +1077,65 @@ def handle_callback(cb: dict) -> None:
         pass
     if not chat:
         return
+    # دکمه‌های کارِ ترجمه (توقف/دریافت/ادامه/بازه) مال کاربرِ صاحب کار است؛ بقیه فقط ادمین
+    prefix, _, rest = data.partition(":")
+    if prefix in ("jb", "rng"):
+        kind, _, jkey = rest.partition(":")
+        try:
+            aj = active_jobs.get(jkey) or {}
+            rec = get_job_record(jkey)
+            owner = aj.get("uid") or rec.get("uid")
+            if not (is_admin(uid) or (owner and int(owner) == int(uid))):
+                return
+            if prefix == "rng":
+                ev = range_replies.get(int(uid))
+                if ev is None or ev.is_set():
+                    return
+                if kind == "all":
+                    range_values[int(uid)] = "all"
+                    ev.set()
+                elif kind == "part":
+                    edit(chat, mid, "✂️ بازهٔ صفحه را بفرست (مثلاً: <code>۱۰-۵۰</code> یا <code>۱۰ تا ۵۰</code>)\n"
+                                    "فقط شروع را بفرستی، تا پایان فایل ترجمه می‌شود.\n"
+                                    "برای لغو بنویس: <code>لغو</code>")
+                return
+            # prefix == "jb"
+            if kind == "pause":
+                job_pause.set()
+                try:
+                    edit(chat, mid, "⏸ درخواست توقف ثبت شد؛ تا پایان صفحهٔ جاری صبر کن…")
+                except TgError:
+                    pass
+                return
+            if kind == "part":
+                handle_send_partial(chat, jkey, aj, rec)
+                return
+            if kind == "resume":
+                if draining.is_set():
+                    try:
+                        send(chat, "⏳ چرخه در حال بسته‌شدن است؛ چرخهٔ بعدی (چند دقیقهٔ دیگر) "
+                                   "خودکار ادامه می‌دهد.")
+                    except TgError:
+                        pass
+                    return
+                if rec.get("status") != "paused":
+                    return  # قبلاً صف شده یا تمام شده
+                d = cp_dir(jkey)
+                if not (d / "in.pdf").exists() and not rec.get("cp_ref"):
+                    try:
+                        send(chat, "⚠️ چک‌پوینت در دسترس نیست؛ لطفاً فایل را دوباره بفرست.")
+                    except TgError:
+                        pass
+                    return
+                save_job_record(jkey, status="resuming")
+                job_q.put({"resume": jkey})
+                try:
+                    send(chat, f"▶️ ادامهٔ ترجمه از صفحهٔ {(rec.get('done_pages') or 0) + 1:,} در صف گذاشته شد.")
+                except TgError:
+                    pass
+                return
+        except (ValueError, TypeError):
+            return
     # دکمهٔ بررسی مجدد عضویت مال کاربران عادی است؛ بقیه فقط ادمین
     if not is_admin(uid) and data != "check_join":
         return
@@ -936,16 +1289,22 @@ WELCOME = (
     "🤖 موتور: {engine} — مدل <code>{model}</code>\n"
     "🌐 زبان: {src} → {dst}\n"
     "📎 فایل‌های بزرگ تا ~۲ گیگابایت هم پذیرفته می‌شود\n\n"
-    "💡 فقط کافیست فایل را بفرست؛ پیشرفت ترجمه را همین‌جا نشان می‌دهم."
+    "✂️ فایل‌های بزرگ: می‌توانی «از صفحه … تا صفحه …» ترجمه بگیری\n"
+    "⏸ حین ترجمه: دکمهٔ توقف موقت و دریافت بخش ترجمه‌شده\n"
+    "🔁 فایل‌های خیلی بزرگ: اگر در یک چرخه (۶ ساعت) کامل نشوند، از همان‌جا در چرخهٔ بعد خودکار ادامه می‌گیرند"
 )
 
 HELP = (
     "📄 کافیست فایل PDF را بفرستی (نه لینک، نه عکس).\n"
-    f"سقف صفحه: تا <b>{{limit}}</b> صفحه در هر فایل.\n"
+    f"سقف صفحه: تا <b>{{limit}}</b> صفحه در هر فایل (برای کل فایل یا هر بازه).\n"
     "ترجمه وفادار به متن اصلی است و چیدمان (جای متن، عکس، جدول، اندازه، بولد، رنگ) "
     "حفظ و برای زبان مقصد راست‌چین/آینه‌ای می‌شود.\n\n"
-    "دستورها:\n"
-    "/start — شروع\n/help — همین راهنما\n/id — آیدی عددی تو"
+    "✂️ <b>ترجمهٔ بازه‌ای:</b> برای فایل‌های ۱۵ صفحه‌ای به بالا، اول پرسیده می‌شود؛ "
+    "بازه را مثل <code>۱۰-۵۰</code> بفرست.\n"
+    "⏸ <b>توقف موقت:</b> دکمهٔ زیر پیام پیشرفت — تا همان‌جا ذخیره می‌شود.\n"
+    "📥 <b>دریافت تا اینجا:</b> آخرین snapshot ترجمه‌شده را می‌فرستد (بدون توقف).\n"
+    "▶️ <b>ادامه:</b> با دکمه یا خودکار در چرخهٔ بعد (فایل‌های خیلی بزرگ بین چرخه‌های ۶ ساعته از همان‌جا ادامه می‌گیرند).\n\n"
+    "دستورها:\n/start — شروع\n/help — همین راهنما\n/id — آیدی عددی تو"
 )
 
 LANG_LABEL = {"auto": "خودکار", "en": "انگلیسی", "fa": "فارسی", "ar": "عربی", "fr": "فرانسوی",
@@ -978,6 +1337,10 @@ def on_document(m: dict) -> None:
     if draining.is_set():
         send(chat, "🔄 ربات در حال تعویض چرخهٔ سرویس است؛ حدوداً ۳ دقیقه بعد همین فایل را دوباره بفرست.")
         return
+    ev = range_replies.get(uid)
+    if ev is not None and not ev.is_set():
+        send(chat, "⏳ اول به سوال قبلی جواب بده (کل فایل یا بازهٔ صفحه را بفرست).")
+        return
     touch_user(m)
     if not force_join_ok(uid):
         with state_lock:
@@ -1004,27 +1367,60 @@ def on_document(m: dict) -> None:
         send(chat, "صف ربات پر است؛ چند دقیقه بعد دوباره امتحان کن.")
         return
     user_pending.add(uid)
+    jobkey = f"{uid}_{int(time.time())}"
     job_q.put({"chat": chat, "uid": uid, "file_id": doc["file_id"],
                "mid": m.get("message_id"), "size": fsize, "name": name,
-               "uname": (m.get("from", {}) or {}).get("username") or ""})
+               "uname": (m.get("from", {}) or {}).get("username") or "",
+               "jobkey": jobkey})
     send(chat, f"🟡 فایل در صف قرار گرفت (جایگاه {job_q.qsize()}). "
                "به‌محض شروع ترجمه خبر می‌دهم.")
 
 
 def process_job(job: dict) -> None:
-    chat, uid = job["chat"], job["uid"]
-    file_id, name = job["file_id"], job["name"]
+    """یک کار ترجمه را کامل انجام می‌دهد: دانلود، پرسش بازه، ترجمه، تحویل/چک‌پوینت."""
+    jobkey = job.get("jobkey") or f"{job.get('uid')}_{int(time.time())}"
+
+    # ── مسیر ادامه از چک‌پوینت ──
+    if job.get("resume"):
+        rec = get_job_record(jobkey)
+        if not rec or rec.get("status") not in ("resuming", "paused", "failed_cycle", "queued"):
+            return
+        d = cp_dir(jobkey)
+        if not (d / "in.pdf").exists() and rec.get("cp_ref") and GH_TOKEN and GH_REPO:
+            gh_store.download_checkpoint(GH_REPO, GH_TOKEN, rec["cp_ref"], d, log=log)
+        if not (d / "in.pdf").exists() or not (d / "partial.pdf").exists():
+            log(f"چک‌پوینت {jobkey} ناقص است (in/partial).")
+            drop_job_record(jobkey)
+            try:
+                send(rec.get("chat"), "⚠️ ادامهٔ ترجمه ممکن نشد (چک‌پوینت در دسترس نبود). "
+                                      "لطفاً فایل را دوباره بفرست.")
+            except TgError:
+                pass
+            return
+        job = {"chat": rec.get("chat"), "uid": rec.get("uid"), "name": rec.get("name"),
+               "size": rec.get("size"), "uname": rec.get("uname"), "jobkey": jobkey}
+        if rec.get("range_e"):
+            job["range"] = (int(rec.get("range_s") or 1), int(rec["range_e"]))
+        return _process_file(job, resume_rec=rec)
+
+    return _process_file(job)
+
+
+def _process_file(job: dict, resume_rec: dict | None = None) -> None:
+    chat, uid = int(job["chat"]), int(job["uid"])
+    jobkey = job["jobkey"]
+    name = job.get("name") or "file.pdf"
     fsize = int(job.get("size", 0) or 0)
     mid = job.get("mid")
     st = send(chat, "⬇️ در حال دریافت فایل…")
     stid = st["message_id"]
     last_edit = [0.0]
 
-    def upd(text: str, force: bool = False) -> None:
+    def upd(text: str, force: bool = False, kb: dict | None = None) -> None:
         if force or time.time() - last_edit[0] > 9:
             last_edit[0] = time.time()
             try:
-                edit(chat, stid, text)
+                edit(chat, stid, text, reply_markup=kb)
             except TgError:
                 pass
 
@@ -1033,163 +1429,335 @@ def process_job(job: dict) -> None:
     in_pdf = TMP_DIR / f"{uid}_{stamp}_in.pdf"
     out_pdf = TMP_DIR / f"{uid}_{stamp}_fa.pdf"
 
-    # ── دانلود: فایل‌های ≤۱۹MB از Bot API؛ بزرگ‌تر از طریق MTProto (تا ~۲GB)
+    aj = {"uid": uid, "chat": chat, "stid": stid, "name": name,
+          "part_pdf": "", "last_done": 0}
+    active_jobs[jobkey] = aj
     try:
-        if fsize > MAX_DOWNLOAD:
-            if not mtproto_ready():
-                raise RuntimeError("پشتیبانی MTProto برای فایل‌های بزرگ هنوز آماده نیست.")
-            edit(chat, stid, f"⬇️ فایل بزرگ ({fsize / (1024 * 1024):.0f} مگابایت) — "
-                             "دانلود با MTProto…")
-            if not MT.download(chat, int(mid or 0), in_pdf):
-                raise RuntimeError("دانلود MTProto ناموفق بود.")
+        if resume_rec:
+            d = cp_dir(jobkey)
+            in_pdf = d / "in.pdf"
+            partial_old = d / "partial.pdf"
+            done_old = int(resume_rec.get("done_pages") or 0)
+            n_pages = int(resume_rec.get("pages_total") or 0)
+            try:
+                if not n_pages:
+                    with pymupdf.open(str(in_pdf)) as _d:
+                        n_pages = _d.page_count
+            except Exception:
+                n_pages = 0
+            range_ = job.get("range")
+            upd(f"▶️ ادامهٔ ترجمهٔ «{html_mod.escape(name)}» از صفحهٔ {done_old + 1:,}…",
+                force=True, kb=job_progress_kb(jobkey))
         else:
-            f = api("getFile", file_id=file_id, timeout=30)
-            fp = f.get("file_path", "")
-            r = requests.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{fp}", timeout=180)
-            r.raise_for_status()
-            in_pdf.write_bytes(r.content)
-    except Exception as e:  # noqa: BLE001
-        edit(chat, stid, f"❌ خطا در دانلود فایل: <code>{html_mod.escape(str(e))[:140]}</code>")
-        in_pdf.unlink(missing_ok=True)
-        return
+            partial_old, done_old = None, 0
+            # ── دانلود: فایل‌های ≤۱۹MB از Bot API؛ بزرگ‌تر از طریق MTProto (تا ~۲GB)
+            try:
+                if fsize > MAX_DOWNLOAD:
+                    if not mtproto_ready():
+                        raise RuntimeError("پشتیبانی MTProto برای فایل‌های بزرگ هنوز آماده نیست.")
+                    upd(f"⬇️ فایل بزرگ ({fsize / (1024 * 1024):.0f} مگابایت) — دانلود با MTProto…",
+                        force=True)
+                    if not MT.download(chat, int(mid or 0), in_pdf):
+                        raise RuntimeError("دانلود MTProto ناموفق بود.")
+                else:
+                    f = api("getFile", file_id=job["file_id"], timeout=30)
+                    fp = f.get("file_path", "")
+                    r = requests.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{fp}",
+                                     timeout=180)
+                    r.raise_for_status()
+                    in_pdf.write_bytes(r.content)
+            except Exception as e:  # noqa: BLE001
+                upd(f"❌ خطا در دانلود فایل: <code>{html_mod.escape(str(e))[:140]}</code>", force=True)
+                in_pdf.unlink(missing_ok=True)
+                return
+            try:
+                with pymupdf.open(str(in_pdf)) as _d:
+                    n_pages = _d.page_count
+            except Exception:  # noqa: BLE001
+                upd("❌ این فایل قابل خواندن نیست (شاید رمزگذاری شده باشد).", force=True)
+                in_pdf.unlink(missing_ok=True)
+                return
+            range_ = job.get("range")
 
-    try:
-        with pymupdf.open(str(in_pdf)) as d:
-            n_pages = d.page_count
-    except Exception:  # noqa: BLE001
-        edit(chat, stid, "❌ این فایل قابل خواندن نیست (شاید رمز‌گذاری شده باشد).")
-        in_pdf.unlink(missing_ok=True)
-        return
+        with state_lock:
+            page_limit = int(state["config"].get("page_limit", 40))
 
-    with state_lock:
-        page_limit = int(state["config"].get("page_limit", 40))
-    if n_pages > page_limit:
-        edit(chat, stid, f"⚠️ فایل <b>{n_pages}</b> صفحه دارد؛ سقف فعلی ربات "
-                         f"<b>{page_limit}</b> صفحه است. فایل کوچک‌تری بفرست یا از ادمین سقف را بپرس.")
-        in_pdf.unlink(missing_ok=True)
-        return
-
-    # ── گیت زمان چرخه: فایل خیلی بزرگ اگر تا سقف سخت جاب جا نشود، وسط کار کشته می‌شود؛
-    #    پس از اول با پیام راهنما رد می‌شود تا در چرخهٔ بعدی (خالی‌تر) پذیرفته شود.
-    if RUN_MAX_MINUTES:
-        needed_min = 5 + n_pages * SEC_PER_PAGE_EST / 60
-        remaining_min = (start_ts + JOB_HARD_MINUTES * 60) - time.time()
-        if needed_min > remaining_min:
-            wait_min = max(int(RUN_MAX_MINUTES - (time.time() - start_ts) / 60) + 5, 5)
-            edit(chat, stid, f"⏳ فایل <b>{n_pages}</b> صفحه‌ای حدوداً <b>{needed_min:.0f} دقیقه</b> "
-                             f"وقت می‌برد؛ اما تا پایان امن این چرخه فقط "
-                             f"<b>{max(remaining_min, 0):.0f} دقیقه</b> مانده.\n"
-                             f"⏱ حدود <b>{wait_min} دقیقه</b> دیگر چرخهٔ تازه شروع می‌شود؛ "
-                             "همین فایل را آن موقع دوباره بفرست تا کامل ترجمه شود.")
+        # ── پرسش «کل فایل یا بازه؟» — فقط برای کار تازهٔ به‌اندازهٔ کافی بزرگ
+        if not resume_rec and range_ is None and not job.get("asked") \
+                and n_pages >= RANGE_ASK_MIN and not draining.is_set():
+            save_job_record(jobkey, status="ask", chat=chat, uid=uid, name=name,
+                            file_id=job.get("file_id"), mid=mid, size=fsize,
+                            pages_total=n_pages)
+            send(chat, f"📚 فایل «{html_mod.escape(name)}» — <b>{n_pages:,}</b> صفحه.\n"
+                       "چطور ترجمه کنم؟", reply_markup=ask_range_kb(jobkey))
+            ev = threading.Event()
+            range_replies[uid] = ev
+            deadline = time.time() + RANGE_WAIT_SEC
+            while not ev.is_set() and time.time() < deadline:
+                if job_pause.is_set() or stop_event.is_set() or draining.is_set():
+                    break
+                ev.wait(2.0)
+            val = (range_values.pop(uid, "") or "").strip()
+            range_replies.pop(uid, None)
+            save_job_record(jobkey, asked=True)
+            if job_pause.is_set() or draining.is_set() or stop_event.is_set():
+                save_job_record(jobkey, status="queued", chat=chat, uid=uid,
+                                file_id=job.get("file_id"), mid=mid, size=fsize,
+                                name=name, uname=job.get("uname"), asked=False)
+                in_pdf.unlink(missing_ok=True)
+                upd("⏳ چرخهٔ سرویس در حال تعویض است؛ فایل برای چرخهٔ بعدی نگه داشته شد و "
+                    "کارش خودکار ادامه پیدا می‌کند — نیازی به فرستادن دوباره نیست.", force=True)
+                return
+            if val.translate(_FA_DIGITS).lower() in ("لغو", "cancel", "off", "-"):
+                upd("لغو شد.", force=True)
+                in_pdf.unlink(missing_ok=True)
+                return
+            if val and val != "all":
+                pr = parse_range(val, n_pages)
+                if pr:
+                    range_ = pr
+                else:
+                    upd("بازهٔ ارسالی معتبر نبود؛ کل فایل ترجمه می‌شود.", force=True)
+        elif not resume_rec and range_ is None and not job.get("asked") and draining.is_set():
+            # چرخه در حال بسته‌شدن است؛ کار برای چرخهٔ بعد ذخیره می‌شود
+            save_job_record(jobkey, status="queued", chat=chat, uid=uid,
+                            file_id=job.get("file_id"), mid=mid, size=fsize,
+                            name=name, uname=job.get("uname"), asked=False)
             in_pdf.unlink(missing_ok=True)
+            upd("⏳ چرخه در حال بسته‌شدن است؛ فایل برای چرخهٔ بعدی صف شد (خودکار ادامه می‌گیرد).",
+                force=True)
             return
 
-    with state_lock:
-        speed = state["config"].get("speed", "balanced")
-        src_lang = state["config"].get("src_lang", "auto")
-        dst_lang = state["config"].get("dst_lang", "fa")
-    w, sp = SPEEDS_OC.get(speed, SPEEDS_OC["balanced"])
-    eng = engine()
-    t0 = time.time()
+        # ── اعمال بازه و سقف صفحه
+        if range_:
+            rs, re_ = int(range_[0]), int(range_[1])
+            rs, re_ = max(1, min(rs, n_pages)), max(rs, min(re_, n_pages))
+            range_n = re_ - rs + 1
+            if range_n > page_limit:
+                upd(f"⚠️ بازهٔ انتخابی <b>{range_n:,}</b> صفحه است؛ سقف فعلی ربات "
+                    f"<b>{page_limit:,}</b> صفحه. بازهٔ کوچک‌تری انتخاب کن یا از ادمین سقف را بخواه.",
+                    force=True)
+                if not resume_rec:
+                    in_pdf.unlink(missing_ok=True)
+                return
+        else:
+            rs, re_, range_n = 1, n_pages, n_pages
+            if n_pages > page_limit:
+                upd(f"⚠️ فایل <b>{n_pages:,}</b> صفحه دارد؛ سقف فعلی ربات <b>{page_limit:,}</b> صفحه است.\n"
+                    "دکمهٔ «✂️ از صفحه … تا صفحه …» را بزن و بازهٔ کوچک‌تری بده، یا از ادمین سقف را بخواه.",
+                    force=True)
+                in_pdf.unlink(missing_ok=True)
+                return
 
-    def progress(done: int, total: int) -> None:
-        pct = done * 100 // max(total, 1)
-        bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
-        upd(f"🔄 ترجمه: {bar} {done}/{total} صفحه ({pct}٪)")
+        # ── گیت زمان چرخه: اگر زمان کم است کار به چرخهٔ بعد می‌رود (خودکار ادامه می‌گیرد)؛
+        #    وگرنه شروع می‌شود حتی اگر کامل نشود — چون چک‌پوینت می‌گیریم
+        if RUN_MAX_MINUTES:
+            needed_min = 5 + (re_ - done_old) * SEC_PER_PAGE_EST / 60
+            remaining_min = (start_ts + JOB_HARD_MINUTES * 60) - time.time()
+            if remaining_min < MIN_CYCLE_LEFT_MIN and not resume_rec:
+                wait_min = max(int(RUN_MAX_MINUTES - (time.time() - start_ts) / 60) + 5, 5)
+                save_job_record(jobkey, status="queued", chat=chat, uid=uid,
+                                file_id=job.get("file_id"), mid=mid, size=fsize,
+                                name=name, uname=job.get("uname"),
+                                range_s=rs if range_ else None,
+                                range_e=re_ if range_ else None, asked=True,
+                                pages_total=n_pages)
+                upd(f"⏳ تا پایان این چرخه فقط <b>{max(remaining_min, 0):.0f} دقیقه</b> مانده و "
+                    f"این کار حدوداً <b>{needed_min:.0f} دقیقه</b> وقت می‌برد.\n"
+                    f"⏱ حدود <b>{wait_min} دقیقه</b> دیگر چرخهٔ تازه شروع می‌شود و همین کار "
+                    "خودکار و از همان‌جا ادامه پیدا می‌کند — نیازی به فرستادن دوباره نیست.",
+                    force=True)
+                in_pdf.unlink(missing_ok=True)
+                return
+            if needed_min > remaining_min:
+                upd(f"ℹ️ این کار حدوداً <b>{needed_min:.0f} دقیقه</b> وقت می‌برد ولی تا پایان چرخه فقط "
+                    f"<b>{remaining_min:.0f} دقیقه</b> هست؛ تا جایی که بشود ترجمه می‌کنم، بعد "
+                    "چک‌پوینت می‌گیرم و چرخهٔ بعدی خودش ادامه می‌دهد.", force=True)
 
-    upd(f"🌍 شروع ترجمهٔ <b>{n_pages}</b> صفحه با <code>{eng['model']}</code> "
-        f"({LANG_LABEL.get(src_lang, src_lang)} → {LANG_LABEL.get(dst_lang, dst_lang)})…",
-        force=True)
+        with state_lock:
+            speed = state["config"].get("speed", "balanced")
+            src_lang = state["config"].get("src_lang", "auto")
+            dst_lang = state["config"].get("dst_lang", "fa")
+        w, sp = SPEEDS_OC.get(speed, SPEEDS_OC["balanced"])
+        eng = engine()
+        t0 = time.time()
 
-    # سرویس ترجمه فقط برای همین ترجمه «روشن» و بعد از کار «خاموش» می‌شود (ضد بن)
-    try:
-        opencode_arm()
-    except Exception as e:  # noqa: BLE001
-        edit(chat, stid, f"❌ سرویس ترجمه آماده نیست: <code>{html_mod.escape(str(e))[:140]}</code>")
-        in_pdf.unlink(missing_ok=True)
-        return
-    try:
-        res = core.translate_pdf(str(in_pdf), str(out_pdf), "", model=eng["model"],
-                                 base_url="", workers=w, spacing=sp,
-                                 progress=progress, cancelled=None,
-                                 log=lambda *a: None, mirror=True,
-                                 src_lang=src_lang, dst_lang=dst_lang, use_cli=True,
-                                 oc_bin=OC_BIN, oc_cwd=str(TMP_DIR))
-    except core.FatalTranslationError as err:
-        alert_admin_provider_down("OpenCode Zen", err)
-        edit(chat, stid, "❌ ترجمه انجام نشد: " + short_err(err) + "\nبه ادمین خبر بده.")
-        in_pdf.unlink(missing_ok=True)
-        return
-    except core.TranslationError as err:
-        edit(chat, stid, f"❌ ترجمه ناتمام ماند: {short_err(err)}\n"
-                         "سرویس ترجمه شلوغ است؛ چند دقیقه بعد دوباره امتحان کن.")
-        in_pdf.unlink(missing_ok=True)
-        return
-    except Exception as e:  # noqa: BLE001
-        traceback.print_exc()  # استک کامل در لاگ Actions برای دیباگ
-        edit(chat, stid, f"❌ خطای غیرمنتظره در ترجمه: <code>{html_mod.escape(str(e))[:140]}</code>")
-        in_pdf.unlink(missing_ok=True)
-        return
-    finally:
-        opencode_disarm()
-    usage = (res or {}).get("usage", {})
+        def progress(rel_done: int, rel_total: int) -> None:
+            done_abs = done_old + rel_done
+            aj["last_done"] = done_abs
+            pct = rel_done * 100 // max(rel_total, 1)
+            bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
+            rng_note = f" (بازهٔ {rs:,}–{re_:,})" if range_ else ""
+            upd(f"🔄 ترجمه: {bar} {done_abs:,}/{re_:,} صفحه ({pct}٪){rng_note}",
+                kb=job_progress_kb(jobkey))
 
-    secs = time.time() - t0
-    out_mb = out_pdf.stat().st_size / (1024 * 1024)
-    upd("📤 در حال ارسال فایل ترجمه‌شده…", force=True)
-    failed_n = len((res or {}).get("failed_pages", []))
-    cap = (f"✅ ترجمهٔ «{html_mod.escape(name)}» — {n_pages} صفحه در {secs / 60:.1f} دقیقه"
-           f" | حجم: {out_mb:.1f}MB")
-    if failed_n:
-        cap += f"\n⚠️ {failed_n} صفحه به‌خاطر خطای سرویس ترجمه نشد (متن اصلی ماند)."
+        def extract_progress(rel_done: int, rel_total: int) -> None:
+            if rel_done % 20 == 0 or rel_done == rel_total:
+                upd(f"📖 آماده‌سازی: متنِ {rel_done:,}/{rel_total:,} صفحه استخراج شد…",
+                    kb=job_progress_kb(jobkey))
 
-    # ── آپلود: ≤۴۹.۵MB با Bot API؛ بزرگ‌تر (یا اگر Bot API شکست خورد) با MTProto
-    sent = False
-    if out_mb <= 49.5:
+        if resume_rec:
+            upd(f"🌍 ادامهٔ ترجمه از صفحهٔ {done_old + 1:,} تا {re_:,} با <code>{eng['model']}</code>…",
+                force=True, kb=job_progress_kb(jobkey))
+        else:
+            upd(f"🌍 شروع ترجمهٔ <b>{range_n:,}</b> صفحه با <code>{eng['model']}</code> "
+                f"({LANG_LABEL.get(src_lang, src_lang)} → {LANG_LABEL.get(dst_lang, dst_lang)})…",
+                force=True, kb=job_progress_kb(jobkey))
+        aj["part_pdf"] = str(out_pdf.with_suffix(".part.pdf"))  # برای دکمهٔ «دریافت تا اینجا»
+
+        # سرویس ترجمه فقط برای همین ترجمه «روشن» و بعد از کار «خاموش» می‌شود (ضد بن)
         try:
-            upload_document(chat, out_pdf, cap)
-            sent = True
-        except TgError as e:
-            log(f"آپلود Bot API ناموفق بود؛ تلاش با MTProto: {e}")
-    if not sent:
-        if mtproto_ready():
-            upd("📤 فایل بزرگ است — ارسال با MTProto…")
-            sent = MT.upload(chat, out_pdf, cap)
-        if not sent:
-            edit(chat, stid, f"❌ ارسال فایل ({out_mb:.1f} مگابایت) ناموفق بود؛ دوباره امتحان کن.")
+            opencode_arm()
+        except Exception as e:  # noqa: BLE001
+            upd(f"❌ سرویس ترجمه آماده نیست: <code>{html_mod.escape(str(e))[:140]}</code>", force=True)
             in_pdf.unlink(missing_ok=True)
-            out_pdf.unlink(missing_ok=True)
             return
-    in_pdf.unlink(missing_ok=True)
-    out_pdf.unlink(missing_ok=True)
+        try:
+            res = core.translate_pdf(
+                str(in_pdf), str(out_pdf), "", model=eng["model"],
+                base_url="", workers=w, spacing=sp,
+                progress=progress, cancelled=job_pause,
+                extract_progress=extract_progress,
+                # ادامه: done_old اندیس مطلقِ اولین صفحهٔ ترجمه‌نشده است؛
+                # کار تازه: شروع از ابتدای بازه (rs-1)
+                start_page=done_old if resume_rec else (rs - 1), end_page=re_,
+                log=lambda *a: None, mirror=True,
+                src_lang=src_lang, dst_lang=dst_lang, use_cli=True,
+                oc_bin=OC_BIN, oc_cwd=str(TMP_DIR))
+        except core.FatalTranslationError as err:
+            alert_admin_provider_down("OpenCode Zen", err)
+            upd("❌ ترجمه انجام نشد: " + short_err(err) + "\nبه ادمین خبر بده.", force=True)
+            if not resume_rec:
+                in_pdf.unlink(missing_ok=True)
+            return
+        except core.TranslationError as err:
+            upd(f"❌ ترجمه ناتمام ماند: {short_err(err)}\n"
+                "سرویس ترجمه شلوغ است؛ چند دقیقه بعد دوباره امتحان کن.", force=True)
+            if not resume_rec:
+                in_pdf.unlink(missing_ok=True)
+            return
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()  # استک کامل در لاگ Actions برای دیباگ
+            upd(f"❌ خطای غیرمنتظره در ترجمه: <code>{html_mod.escape(str(e))[:140]}</code>",
+                force=True)
+            if not resume_rec:
+                in_pdf.unlink(missing_ok=True)
+            return
+        finally:
+            opencode_disarm()
 
+        usage = (res or {}).get("usage", {})
+        total_tokens = int(usage.get("total_tokens", 0) or 0)
+        secs = time.time() - t0
+        failed_n = len((res or {}).get("failed_pages", []))
+        skipped_n = len((res or {}).get("skipped_pages", []))
+        rel_translated = int((res or {}).get("translated", 0) or 0)
+        done_abs = done_old + rel_translated
 
-    total_tokens = int(usage.get("total_tokens", 0) or 0)
-    with state_lock:
-        rec = state["users"].setdefault(str(uid), {})
-        rec["pages"] = rec.get("pages", 0) + n_pages
-        rec["files"] = rec.get("files", 0) + 1
-        rec["tokens"] = rec.get("tokens", 0) + total_tokens
-        state["totals"]["files"] = state["totals"].get("files", 0) + 1
-        state["totals"]["pages"] = state["totals"].get("pages", 0) + n_pages
-        state["totals"]["tokens"] = state["totals"].get("tokens", 0) + total_tokens
-    dirty.set()
-    log(f"فایل «{name}» ({n_pages} صفحه) برای {uid} در {secs:.0f}s ترجمه شد ({total_tokens:,} توکن).")
+        # ── توقف موقت / پایان چرخه: چک‌پوینت بگیر و خبر بده
+        if (res or {}).get("cancelled"):
+            # ادغام پیشرفت قبلی با بخش تازه (برای ادامهٔ کار) — وگرنه پیشرفت قبلی از بین می‌رود
+            new_part = Path((res or {}).get("output") or "")
+            merged = new_part
+            if new_part.exists() and (done_old > 0 or (resume_rec and partial_old)):
+                merged = merge_partials(partial_old, new_part, done_old,
+                                        TMP_DIR / f"{jobkey}_cp_partial.pdf")
+                if merged != new_part:
+                    new_part.unlink(missing_ok=True)
+            ref = save_checkpoint(jobkey,
+                                  {"name": name, "pages_total": n_pages, "size": fsize,
+                                   "uid": uid, "chat": chat, "range_s": rs if range_ else None,
+                                   "range_e": re_ if range_ else None,
+                                   "cp_ref": (resume_rec or {}).get("cp_ref") or ""},
+                                  in_pdf, merged, done_abs)
+            out_mb = 0.0
+            pp = cp_dir(jobkey) / "partial.pdf"
+            if pp.exists():
+                out_mb = pp.stat().st_size / (1024 * 1024)
+            reason = "توقف موقت" if not draining.is_set() else "پایان چرخهٔ سرویس"
+            msg = (f"⏸ <b>{reason}</b> — ترجمه تا صفحهٔ <b>{done_abs:,}</b> ذخیره شد "
+                   f"(از {re_:,}).\n"
+                   "▶️ با دکمهٔ ادامه، از همین‌جا ادامه می‌گیرد؛ چرخهٔ بعدی هم خودش ادامه می‌دهد.")
+            if not ref and not pp.exists():
+                msg += "\n⚠️ ذخیرهٔ چک‌پوینت ناموفق بود؛ فایل را دوباره بفرست."
+            upd(msg, force=True, kb=paused_kb(jobkey, done_abs))
+            log(f"چک‌پوینت {jobkey}: {done_abs} صفحه ({out_mb:.1f}MB) ref={ref or 'محلی'}")
+            if ADMIN_ID and not ref:
+                try:
+                    send(ADMIN_ID, f"⚠️ آپلود چک‌پوینت «{html_mod.escape(name)}» ناموفق بود "
+                                   f"(done={done_abs}) — ادامه فقط در همین رانر ممکن است.")
+                except TgError:
+                    pass
+            return
 
-    # گزارش مصرف توکن هر فایل برای ادمین
-    if ADMIN_ID:
+        # ── موفقیت: ادغام پیشرفت قبلی (اگر ادامه بود)، تحویل، پاکسازی
+        upd("📤 در حال آماده‌سازی و ارسال فایل ترجمه‌شده…", force=True)
+        final_path = out_pdf
+        if resume_rec and done_old > 0 and partial_old and partial_old.exists():
+            final_path = TMP_DIR / f"{uid}_{stamp}_final.pdf"
+            merge_partials(partial_old, out_pdf, done_old, final_path)
+            out_pdf.unlink(missing_ok=True)
+
+        out_mb = final_path.stat().st_size / (1024 * 1024)
+        if range_ and done_abs < re_:
+            cap = (f"✅ ترجمهٔ «{html_mod.escape(name)}» — صفحات {_fmt_pages(rs, re_)} در "
+                   f"{secs / 60:.1f} دقیقه | حجم: {out_mb:.1f}MB")
+        else:
+            cap = (f"✅ ترجمهٔ «{html_mod.escape(name)}» — {re_ - done_old:,} صفحه در "
+                   f"{secs / 60:.1f} دقیقه | حجم: {out_mb:.1f}MB")
+        warn = ""
+        if failed_n:
+            warn += f"\n⚠️ {failed_n} صفحه به‌خاطر خطای سرویس ترجمه نشد (متن اصلی ماند)."
+        if skipped_n:
+            warn += f"\n⚠️ {skipped_n} صفحه متن قابل استخراج نداشت (بدون تغییر کپی شد)."
+        cap += warn
+
+        upd("📤 در حال ارسال فایل ترجمه‌شده…", force=True)
+        if not deliver_file(chat, final_path, cap):
+            upd(f"❌ ارسال فایل ({out_mb:.1f} مگابایت) ناموفق بود؛ دوباره امتحان کن.", force=True)
+            if not resume_rec:
+                in_pdf.unlink(missing_ok=True)
+            final_path.unlink(missing_ok=True)
+            return
+
+        # پاکسازی چک‌پوینت و رکورد
+        old_ref = (resume_rec or {}).get("cp_ref") or ""
+        if old_ref:
+            gh_store.cleanup_checkpoint(GH_REPO, GH_TOKEN, old_ref)
+        shutil.rmtree(cp_dir(jobkey), ignore_errors=True)
+        drop_job_record(jobkey)
+
+        pages_counted = rel_translated
+        with state_lock:
+            rec_u = state["users"].setdefault(str(uid), {})
+            rec_u["pages"] = rec_u.get("pages", 0) + pages_counted
+            rec_u["files"] = rec_u.get("files", 0) + 1
+            rec_u["tokens"] = rec_u.get("tokens", 0) + total_tokens
+            state["totals"]["files"] = state["totals"].get("files", 0) + 1
+            state["totals"]["pages"] = state["totals"].get("pages", 0) + pages_counted
+            state["totals"]["tokens"] = state["totals"].get("tokens", 0) + total_tokens
+        dirty.set()
+        log(f"فایل «{name}» ({pages_counted} صفحه در این نوبت) برای {uid} در {secs:.0f}s "
+            f"ترجمه شد ({total_tokens:,} توکن).")
+
+        if in_pdf.exists() and not resume_rec:
+            in_pdf.unlink(missing_ok=True)
+        if not ADMIN_ID:
+            return
         try:
             uname = job.get("uname") or ""
             send(ADMIN_ID,
                  "📊 <b>گزارش مصرف توکن</b>\n"
                  f"📄 فایل: <code>{html_mod.escape(name)}</code>\n"
                  f"👤 کاربر: <code>{uid}</code>" + (f" (@{uname})" if uname else "") + "\n"
-                 f"📑 صفحات: {n_pages} | ⏱ {secs / 60:.1f} دقیقه\n"
+                 f"📑 صفحات این نوبت: {pages_counted:,} | ⏱ {secs / 60:.1f} دقیقه\n"
                  f"🔤 ورودی: {usage.get('prompt_tokens', 0):,} | خروجی: {usage.get('completion_tokens', 0):,}\n"
                  f"🧮 مجموع: <b>{total_tokens:,}</b> توکن در {usage.get('api_calls', 0)} درخواست\n"
                  f"🤖 {eng['label']} / <code>{eng['model']}</code>")
         except TgError:
             pass
+    finally:
+        active_jobs.pop(jobkey, None)
 
 
 def worker() -> None:
@@ -1197,20 +1765,39 @@ def worker() -> None:
         try:
             job = job_q.get(timeout=1)
         except queue.Empty:
+            if draining.is_set():
+                break   # چرخه بسته شد و کار دیگری نیست
             continue
+        if draining.is_set():
+            # چرخه در حال بسته‌شدن است؛ این کار برای چرخهٔ بعد ذخیره می‌شود
+            if job.get("resume"):
+                save_job_record(job["resume"], status="paused")
+            else:
+                key = job.get("jobkey") or f"{job.get('uid')}_{int(time.time())}"
+                save_job_record(key, status="queued", chat=job.get("chat"),
+                                uid=job.get("uid"), file_id=job.get("file_id"),
+                                mid=job.get("mid"), size=job.get("size"),
+                                name=job.get("name"), uname=job.get("uname"),
+                                range_s=(job.get("range") or (None, None))[0],
+                                range_e=(job.get("range") or (None, None))[1],
+                                asked=job.get("asked"))
+            job_q.task_done()
+            continue
+        job_pause.clear()   # توقفِ کار قبلی نباید به این کار سرایت کند
         worker_busy.set()
         try:
             process_job(job)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
             try:
-                send(job["chat"], "❌ خطای غیرمنتظره در پردازش؛ دوباره امتحان کن.")
+                send(job.get("chat"), "❌ خطای غیرمنتظره در پردازش؛ دوباره امتحان کن.")
             except TgError:
                 pass
         finally:
-            user_pending.discard(job["uid"])
+            user_pending.discard(job.get("uid"))
             worker_busy.clear()
             job_q.task_done()
+    snapshot_queues_to_state()
 
 
 # --------------------------------------------------------------------------
@@ -1270,6 +1857,12 @@ def handle_message(m: dict) -> None:
         request_access(m, silent=(uid in auth_requested))
         if uid in auth_requested:
             send(chat_id, "درخواست شما قبلاً ثبت شده؛ منتظر تأیید ادمین باش.")
+        return
+    # ── پاسخ کاربر به سوال «بازهٔ صفحه» (متن آزاد)
+    _rev = range_replies.get(uid)
+    if _rev is not None and not _rev.is_set():
+        range_values[uid] = text
+        _rev.set()
         return
     if text.startswith("/start"):
         cmd_start(m)
@@ -1349,9 +1942,11 @@ def polling_loop() -> None:
     backoff = 2
     conflicts = 0
     drain_noted = False
+    drain_deadline = 0.0
     while not stop_event.is_set():
-        # حالت Actions: پس از پایان چرخه، تا خالی شدن صف ادامه می‌دهیم؛
-        # ترجمهٔ در جریان (مثلاً فایل ۲۰۰۰ صفحه‌ای) نباید وسط کار کشته شود.
+        # حالت Actions: پس از پایان چرخه، فاز تخلیه شروع می‌شود؛ کارهای کوچک فرصت
+        # تمام‌کردن طبیعی دارند (مهلت DRAIN_GRACE) و کارهای بزرگ توقف موقت +
+        # چک‌پوینت می‌شوند تا در چرخهٔ بعد از همان‌جا ادامه بگیرند.
         if RUN_MAX_MINUTES and time.time() - start_ts > RUN_MAX_MINUTES * 60:
             if not worker_busy.is_set() and job_q.empty():
                 # تأیید دوم بعد از چند ثانیه: جاب تازه‌ای بین دو بررسی شروع نشده باشد
@@ -1363,8 +1958,11 @@ def polling_loop() -> None:
             if not drain_noted:
                 drain_noted = True
                 draining.set()
-                log("زمان چرخه تمام شد؛ در انتظار اتمام کارهای در جریان "
-                    "(فایل جدید پذیرفته نمی‌شود)…")
+                drain_deadline = time.time() + DRAIN_GRACE_MINUTES * 60
+                log("زمان چرخه تمام شد؛ فاز تخلیه شروع شد (فایل جدید پذیرفته نمی‌شود)…")
+            elif worker_busy.is_set() and not job_pause.is_set() and time.time() > drain_deadline:
+                job_pause.set()
+                log("مهلت تخلیه تمام شد؛ درخواست توقف موقتِ کار در جریان (چک‌پوینت)…")
         try:
             r = requests.get(f"{TG}/getUpdates", params={
                 "offset": offset, "timeout": 30,
@@ -1428,6 +2026,9 @@ def main() -> None:
             dirty.set()
 
     MT.start()  # کلاینت MTProto برای فایل‌های بزرگ (در ترد جدا)
+
+    # چک‌پوینت‌ها و کارهای معلق چرخهٔ قبل — قبل از روشن‌شدن ورکر صف می‌شوند
+    boot_resume()
 
     threading.Thread(target=health_server, daemon=True).start()
     threading.Thread(target=sync_loop, daemon=True).start()

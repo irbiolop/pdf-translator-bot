@@ -425,7 +425,7 @@ def _split_blocks_by_tables(page: "pymupdf.Page", blocks: list[dict],
     return out
 
 
-def _batch_items(items: list[tuple[int, str]], max_chars: int = 6000) -> list[list[tuple[int, str]]]:
+def _batch_items(items: list[tuple[int, str]], max_chars: int = 8000) -> list[list[tuple[int, str]]]:
     """دسته‌بندی آیتم‌ها بر اساس حجم کاراکتر (برای جلوگیری از برخورد به سقف توکن)."""
     batches, cur, size = [], [], 0
     for it in items:
@@ -736,7 +736,7 @@ def oc_translate_segments(model: str, segments: list[str], *,
 # --------------------------------------------------------------------------
 
 
-def _build_css():
+def _build_css(log=print):
     """CSS فونت فارسی به‌همراه آرشیو فونت؛ اگر فونت نبود فونت پیش‌فرض."""
     if FONT_REG.exists() and FONT_BOLD.exists():
         try:
@@ -993,7 +993,9 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                   progress=None, cancelled=None, log=print, translator=None,
                   mirror=True, base_url="", workers=1, spacing=DEFAULT_SPACING,
                   src_lang="auto", dst_lang="fa", use_cli=False,
-                  oc_bin="opencode", oc_cwd=None) -> dict:
+                  oc_bin="opencode", oc_cwd=None,
+                  start_page: int = 0, end_page: int | None = None,
+                  extract_progress=None) -> dict:
     """
     ترجمهٔ کامل فایل PDF به زبان مقصد با حفظ چیدمان.
 
@@ -1002,10 +1004,13 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
     use_cli: ترجمه با اجرای CLI اوپن‌کد (مسیر اصلی سرویس Zen؛ ردهٔ رایگان فقط
     از داخل خودِ OpenCode جواب می‌دهد). api_key در این حالت استفاده نمی‌شود.
     workers: تعداد ترجمه‌های موازی؛ spacing حداقل فاصلهٔ شروع درخواست‌ها/فراخوانی‌ها.
+    start_page/end_page: بازهٔ صفحات (۰مبنا؛ انتهای بازه ساختارِ باز) — برای ترجمهٔ
+    پارت‌به‌پارت و ادامه از چک‌پوینت؛ پیش‌فرض کل فایل.
     translator: برای تست — تابعی (segments -> translations) بدون اینترنت.
     خروجی: دیکشنری آمار شامل usage (مصرف توکن ورودی/خروجی/مجموع و تعداد درخواست‌ها).
     """
     progress = progress or (lambda done, total: None)
+    extract_progress = extract_progress or (lambda done, total: None)
     if delay is None:
         delay = DEFAULT_DELAY
     t0 = time.time()
@@ -1021,15 +1026,22 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
     tmp_path = out_path.with_suffix(".part.pdf")
 
     doc = pymupdf.open(str(in_path))
-    total = doc.page_count
-    log(f"فایل «{in_path.name}» با {total} صفحه باز شد. مدل: {model}")
-    arch, css = _build_css()
+    total_all = doc.page_count
+    p_start = max(0, min(int(start_page), total_all - 1))
+    p_end = total_all if end_page is None else max(p_start + 1, min(int(end_page), total_all))
+    total = p_end - p_start
+    if p_start > 0:
+        log(f"ادامه از صفحهٔ {p_start + 1} تا {p_end} از مجموع {total_all} صفحه.")
+    log(f"فایل «{in_path.name}» با {total_all} صفحه باز شد. مدل: {model}")
+    arch, css = _build_css(log)
 
     usage: dict = {}
     usage_lock = threading.Lock()
     limiter = _RateLimiter(spacing if workers > 1 else 0.0)
-    stats = {"pages": total, "translated": 0, "no_text_pages": 0,
-             "failed_pages": [], "output": str(out_path), "cancelled": False,
+    stats = {"pages": total_all, "range_start": p_start, "range_end": p_end,
+             "translated": 0, "no_text_pages": 0,
+             "failed_pages": [], "skipped_pages": [],
+             "output": str(out_path), "cancelled": False,
              "usage": usage}
 
     _PURE_NUM_RE = re.compile(r"^[\d\s.,;:\-–—/()%#]+$")
@@ -1057,52 +1069,65 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
 
     try:
         # ── فاز ۱: استخراج صفحات و صف‌کردن بچ‌های ترجمه؛ ترجمهٔ صفحات بعدی
-        #    در پس‌زمینه به‌موازات بازسازی صفحات قبلی پیش می‌رود
-        for pno in range(total):
+        #    در پس‌زمینه به‌موازات بازسازی صفحات قبلی پیش می‌رود.
+        #    هر صفحه در گارد جداگانه است تا یک صفحهٔ خراب/عجیب PDF کل فایل
+        #    چندصفحه‌ای را با خطای «list index out of range» نکشد.
+        for pno in range(p_start, p_end):
             if cancelled is not None and cancelled.is_set():
                 stats["cancelled"] = True
                 log("لغو شد؛ پیشرفت فعلی ذخیره می‌شود…")
                 break
+            try:
+                page = doc[pno]
+                blocks = extract_blocks(page)
+                if not blocks:
+                    stats["no_text_pages"] += 1
+                    log(f"صفحهٔ {pno + 1}: متن قابل استخراج نداشت (تصویری است؟) — بدون تغییر کپی شد.")
+                    page_jobs.append((pno, [], [], [], []))
+                    continue
+                # جلوگیری از «متن روی متن»: بلوک‌های همپوشان ادغام می‌شوند
+                blocks = _merge_overlapping_blocks(blocks)
+                # جدول‌ها: هر سلول یک بلوک مستقل تا ترجمه از خانه بیرون نزند
+                blocks = _split_blocks_by_tables(page, blocks, log=log)
+                # جهت متن (راست‌چین/چپ‌چین) بر اساس زبان مقصد
+                for b in blocks:
+                    b["_rtl"] = rtl
 
-            page = doc[pno]
-            blocks = extract_blocks(page)
-            if not blocks:
-                stats["no_text_pages"] += 1
-                log(f"صفحهٔ {pno + 1}: متن قابل استخراج نداشت (تصویری است؟) — بدون تغییر کپی شد.")
+                segs = [b["text"] for b in blocks]
+                trans = [""] * len(segs)
+
+                if translator is not None:
+                    # حالت تست: ترجمهٔ ساختگی
+                    got = [str(t) for t in translator(segs)]
+                    trans = got + segs[len(got):]
+                    page_jobs.append((pno, blocks, segs, trans, []))
+                    continue
+
+                # اعداد و علائم خالص (مثل شمارهٔ صفحه) نیازی به ترجمه ندارند
+                items = [(i, s) for i, s in enumerate(segs)
+                         if s.strip() and not _PURE_NUM_RE.match(s.strip())]
+                for idx, s in enumerate(segs):
+                    if _PURE_NUM_RE.match(s.strip() or "x0x"):
+                        trans[idx] = s
+
+                tasks = []
+                for batch in _batch_items(items):
+                    if pool is not None:
+                        tasks.append((batch, pool.submit(_call_batch, batch)))
+                    else:
+                        tasks.append((batch, None))
+                page_jobs.append((pno, blocks, segs, trans, tasks))
+            except FatalTranslationError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                # صفحهٔ مشکل‌دار بدون ترجمه کپی می‌شود؛ ادامهٔ فایل زنده می‌ماند
+                stats["skipped_pages"].append(pno + 1)
+                log(f"صفحهٔ {pno + 1}: خطا در استخراج متن ({e}) — بدون تغییر کپی شد.")
+                log(traceback.format_exc())
                 page_jobs.append((pno, [], [], [], []))
                 continue
-            # جلوگیری از «متن روی متن»: بلوک‌های همپوشان ادغام می‌شوند
-            blocks = _merge_overlapping_blocks(blocks)
-            # جدول‌ها: هر سلول یک بلوک مستقل تا ترجمه از خانه بیرون نزند
-            blocks = _split_blocks_by_tables(page, blocks, log=log)
-            # جهت متن (راست‌چین/چپ‌چین) بر اساس زبان مقصد
-            for b in blocks:
-                b["_rtl"] = rtl
-
-            segs = [b["text"] for b in blocks]
-            trans = [""] * len(segs)
-
-            if translator is not None:
-                # حالت تست: ترجمهٔ ساختگی
-                got = [str(t) for t in translator(segs)]
-                trans = got + segs[len(got):]
-                page_jobs.append((pno, blocks, segs, trans, []))
-                continue
-
-            # اعداد و علائم خالص (مثل شمارهٔ صفحه) نیازی به ترجمه ندارند
-            items = [(i, s) for i, s in enumerate(segs)
-                     if s.strip() and not _PURE_NUM_RE.match(s.strip())]
-            for idx, s in enumerate(segs):
-                if _PURE_NUM_RE.match(s.strip() or "x0x"):
-                    trans[idx] = s
-
-            tasks = []
-            for batch in _batch_items(items):
-                if pool is not None:
-                    tasks.append((batch, pool.submit(_call_batch, batch)))
-                else:
-                    tasks.append((batch, None))
-            page_jobs.append((pno, blocks, segs, trans, tasks))
+            finally:
+                extract_progress(pno - p_start + 1, total)
 
         # ── فاز ۲: بازسازی صفحات به ترتیب؛ نتیجهٔ هر بچ گرفته و درج می‌شود
         for pno, blocks, segs, trans, tasks in page_jobs:
@@ -1112,7 +1137,7 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                 break
 
             if not blocks:
-                progress(pno + 1, total)
+                progress(pno - p_start + 1, total)
                 continue
 
             page = doc[pno]
@@ -1219,14 +1244,17 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                 log(f"صفحهٔ {pno + 1}: خطای غیرمنتظره در بازسازی ({e}) — "
                     "این صفحه بدون ترجمه کپی می‌شود؛ ادامهٔ فایل زنده است.")
                 log(traceback.format_exc())
-            progress(pno + 1, total)
+            progress(pno - p_start + 1, total)
 
             # ذخیرهٔ موقت هر ۲۵ صفحه (برای جلوگیری از از دست رفتن پیشرفت)
-            if (pno + 1) % 25 == 0 and pno + 1 < total:
-                doc.save(str(tmp_path), garbage=3, deflate=True)
-                log(f"ذخیرهٔ موقت انجام شد ({pno + 1} از {total}).")
+            if (pno + 1 - p_start) % 25 == 0 and pno + 1 < p_end:
+                try:
+                    doc.save(str(tmp_path), garbage=3, deflate=True)
+                    log(f"ذخیرهٔ موقت انجام شد ({pno + 1} از {p_end}).")
+                except Exception as e:  # noqa: BLE001
+                    log(f"ذخیرهٔ موقت ناموفق بود (ادامه می‌دهیم): {e}")
 
-            if pool is None and delay and pno + 1 < total:
+            if pool is None and translator is None and delay and pno + 1 < p_end:
                 time.sleep(delay)
     finally:
         # بستن استخر: کارهای در صف لغو می‌شوند؛ حداکثر «workers» درخواستِ در جریان تمام می‌شود
@@ -1234,16 +1262,30 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
             pool.shutdown(wait=False, cancel_futures=True)
 
     # اگر سرویس هیچ صفحه‌ای را ترجمه نکرد (موج قطعی 5xx/قطعیِ کامل)، به‌جای
-    # تحویل فایلِ دست‌نخورده با ظاهرِ موفقیت، خطای فیلورورپذیر پرتاب می‌شود.
+    # تحویل فایلِ دست‌نخورده با ظاهرِ موفقیت، خطای فیلورورِ ربات پرتاب می‌شود.
     if not stats["cancelled"] and stats["translated"] == 0 and stats["failed_pages"]:
         raise FatalTranslationError(
             "هیچ صفحه‌ای ترجمه نشد؛ سرویس ترجمه پاسخگو نبود.", code="provider")
 
     if stats["cancelled"]:
-        _finalize_save(doc, tmp_path, log)
+        try:
+            _finalize_save(doc, tmp_path, log)
+        except Exception as e:  # noqa: BLE001
+            log(f"ذخیرهٔ نهایی ناتمام ناموفق بود ({e})؛ ذخیرهٔ ساده…")
+            try:
+                doc.save(str(tmp_path), garbage=1, deflate=True)
+            except Exception as e2:  # noqa: BLE001
+                log(f"ذخیرهٔ ساده هم ناموفق بود: {e2}")
         stats["output"] = str(tmp_path)
     else:
-        _finalize_save(doc, out_path, log)
+        try:
+            _finalize_save(doc, out_path, log)
+        except Exception as e:  # noqa: BLE001
+            log(f"ذخیرهٔ نهایی ناموفق بود ({e})؛ ذخیرهٔ ساده…")
+            try:
+                doc.save(str(out_path), garbage=1, deflate=True)
+            except Exception as e2:  # noqa: BLE001
+                log(f"ذخیرهٔ ساده هم ناموفق بود: {e2}")
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
     doc.close()
