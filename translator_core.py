@@ -425,8 +425,8 @@ def _split_blocks_by_tables(page: "pymupdf.Page", blocks: list[dict],
     return out
 
 
-def _batch_items(items: list[tuple[int, str]], max_chars: int = 8000) -> list[list[tuple[int, str]]]:
-    """دسته‌بندی آیتم‌ها بر اساس حجم کاراکتر (برای جلوگیری از برخورد به سقف توکن)."""
+def _batch_items(items: list[tuple[int, str]], max_chars: int = 12000) -> list[list[tuple[int, str]]]:
+    """دسته‌بندی آیتم‌ها بر اساس حجم کاراکتر (بچ بزرگ‌تر = فراخوانی CLI کمتر = سریع‌تر)."""
     batches, cur, size = [], [], 0
     for it in items:
         n = max(len(it[1]), 1)
@@ -438,6 +438,197 @@ def _batch_items(items: list[tuple[int, str]], max_chars: int = 8000) -> list[li
     if cur:
         batches.append(cur)
     return batches
+
+
+# --------------------------------------------------------------------------
+# OCR — استخراج متن از صفحات تصویری (اسکن/اسکرین‌شات/کامیک) با Tesseract
+# --------------------------------------------------------------------------
+
+# نگاشت کد زبان → زبان Tesseract
+TESS_LANG_MAP = {
+    "en": "eng", "fa": "fas", "ar": "ara", "fr": "fra", "de": "deu",
+    "es": "spa", "it": "ita", "pt": "por", "tr": "tur", "ru": "rus",
+    "zh": "chi_sim", "ja": "chi_sim", "ko": "kor", "hi": "hin", "ur": "urd",
+}
+
+
+def tess_lang_for(src_lang: str) -> str:
+    """کد زبان تسرکت بر اساس زبان مبدأ؛ «auto» ترکیب انگلیسی+فارسی."""
+    if not src_lang or src_lang == "auto":
+        return "eng+fas"
+    return TESS_LANG_MAP.get(src_lang, "eng")
+
+
+def ocr_available() -> bool:
+    return bool(shutil.which("tesseract"))
+
+
+def _sample_fill(pix, box_px: tuple[float, float, float, float],
+                 page_w_px: int, page_h_px: int) -> tuple[float, float, float]:
+    """رنگ پس‌زمینهٔ اطراف کادر متن از خود تصویر نمونه‌برداری می‌شود تا پوششِ
+    متن اصلی هم‌رنگ حباب/صفحه باشد (سفید، مشکی یا هر رنگ دیگر)."""
+    x0, y0, x1, y1 = box_px
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    pts = [(cx, y0 - 3), (cx, y1 + 3), (x0 - 3, cy), (x1 + 3, cy),
+           (cx, y0 - 9), (cx, y1 + 9)]
+    cols = []
+    try:
+        for px, py in pts:
+            ix = int(min(max(px, 0), page_w_px - 1))
+            iy = int(min(max(py, 0), page_h_px - 1))
+            p = pix.pixel(ix, iy)
+            if p and len(p) >= 3:
+                cols.append((p[0], p[1], p[2]))
+    except Exception:  # noqa: BLE001
+        return (1.0, 1.0, 1.0)
+    if not cols:
+        return (1.0, 1.0, 1.0)
+    med = tuple(sorted(c[i] for c in cols)[len(cols) // 2] for i in range(3))
+    return (round(med[0] / 255.0, 3), round(med[1] / 255.0, 3), round(med[2] / 255.0, 3))
+
+
+def ocr_page_blocks(page: "pymupdf.Page", langs: str, dpi: int = 200,
+                    log=print) -> list[dict]:
+    """متن صفحهٔ تصویری با Tesseract استخراج و به بلوک‌های هم‌ساختارِ
+    extract_blocks تبدیل می‌شود (bbox/اندازه/فاصلهٔ خط) + رنگ پس‌زمینه برای
+    پوششِ متن اصلی. خروجی خالی یعنی OCR چیزی پیدا نکرد."""
+    if not langs:
+        langs = "eng+fas"
+    import tempfile
+    zoom = dpi / 72.0
+    try:
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+    except Exception as e:  # noqa: BLE001
+        log(f"OCR: رندر صفحه ناموفق بود: {e}")
+        return []
+    tmpd = Path(tempfile.mkdtemp(prefix="ocr"))
+    tmp = tmpd / "page.png"
+    try:
+        tmp.write_bytes(pix.tobytes("png"))
+        try:
+            proc = subprocess.run(
+                ["tesseract", str(tmp), "stdout", "-l", langs,
+                 "--oem", "3", "--psm", "3", "tsv"],
+                capture_output=True, text=True, timeout=180)
+        except FileNotFoundError:
+            log("tesseract نصب نیست؛ OCR انجام نشد.")
+            return []
+        except subprocess.TimeoutExpired:
+            log("OCR تایم‌اوت شد؛ این صفحه رد شد.")
+            return []
+        if proc.returncode != 0:
+            log(f"OCR ناموفق بود: {(proc.stderr or '')[:120]}")
+            return []
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+            tmpd.rmdir()
+        except OSError:
+            pass
+
+    scale = 72.0 / float(dpi)
+    pw, ph = pix.width, pix.height
+    header: list[str] | None = None
+    lines: dict[tuple, list] = {}
+    order: list[tuple] = []
+    for ln in (proc.stdout or "").splitlines():
+        parts = ln.split("\t")
+        if header is None:
+            if ln.startswith("level\t"):
+                header = parts
+            continue
+        if header is None or len(parts) < len(header):
+            continue
+        d = dict(zip(header, parts))
+        if d.get("level") != "5":  # فقط واژه‌ها
+            continue
+        try:
+            conf = float(d.get("conf", "-1"))
+        except ValueError:
+            conf = -1.0
+        txt = (d.get("text") or "").strip()
+        if conf < 35 or not txt:
+            continue
+        try:
+            key = (int(d.get("block_num", "0")), int(d.get("par_num", "0")),
+                   int(d.get("line_num", "0")))
+        except ValueError:
+            continue
+        if key not in lines:
+            lines[key] = []
+            order.append(key)
+        try:
+            lines[key].append((int(d.get("left", "0")), int(d.get("top", "0")),
+                               int(d.get("width", "0")), int(d.get("height", "0")), txt))
+        except ValueError:
+            continue
+    if not lines:
+        return []
+
+    # هر (block, par) تسرکت یک بلوک؛ خطوطش به‌ترتیب x مرتب می‌شوند
+    par_lines: dict[tuple, list] = {}
+    par_order: list[tuple] = []
+    for key in order:
+        pk = (key[0], key[1])
+        if pk not in par_lines:
+            par_lines[pk] = []
+            par_order.append(pk)
+        ws = sorted(lines[key], key=lambda w: w[0])
+        rect = pymupdf.Rect(min(w[0] for w in ws) * scale, min(w[1] for w in ws) * scale,
+                            max(w[0] + w[2] for w in ws) * scale,
+                            max(w[1] + w[3] for w in ws) * scale)
+        par_lines[pk].append((rect, " ".join(w[4] for w in ws)))
+
+    blocks: list[dict] = []
+    for pk in par_order:
+        lrs = [r for r, _ in par_lines[pk]]
+        raws = [t for _, t in par_lines[pk]]
+        if not any(t.strip() for t in raws):
+            continue
+        bbox = _union_rects(lrs)
+        if bbox.width <= 2 or bbox.height <= 2:
+            continue
+        hs = sorted(r.height for r in lrs)
+        size = max(round((hs[len(hs) // 2] * 0.74) * 2) / 2, 4.5)
+        leading = MIN_LEADING
+        if len(lrs) > 1:
+            tops = sorted(r.y0 for r in lrs)
+            gaps = [b - a for a, b in zip(tops, tops[1:]) if b - a > 1]
+            if gaps:
+                g = sorted(gaps)[len(gaps) // 2]
+                leading = min(max(g / max(size, 1.0), 1.2), 1.9)
+        fill = _sample_fill(pix, (bbox.x0 / scale, bbox.y0 / scale,
+                                  bbox.x1 / scale, bbox.y1 / scale), pw, ph)
+        lum = 0.299 * fill[0] + 0.587 * fill[1] + 0.114 * fill[2]
+        blocks.append({
+            "bbox": bbox, "line_rects": lrs, "raw_lines": raws,
+            "text": _join_lines(raws), "size": size, "leading": leading,
+            "bold": False, "italic": False,
+            "color": "#ffffff" if lum < 0.45 else "#000000",
+            "align": "right", "_ocr": True, "_fill": fill,
+        })
+    # ترتیب خواندن: بالا به پایین؛ در هم‌ارتفاع‌ها راست به چپ (اسناد RTL/کمیک)
+    blocks.sort(key=lambda b: (round(b["bbox"].y0, 1), -round(b["bbox"].x0, 1)))
+    return blocks
+
+
+def _rasterize_page(page: "pymupdf.Page", dpi: int, quality: int, log=print) -> None:
+    """بازسازی محتوای صفحهٔ تصویری به یک JPEG فشرده — کاهش شدید حجم خروجی.
+    فقط برای صفحاتی به‌کار می‌رود که همهٔ محتوایشان تصویر است (حالت عکس‌محور)."""
+    try:
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(dpi / 72.0, dpi / 72.0), alpha=False)
+        jpg = pix.tobytes("jpeg", jpg_quality=quality)
+        page.clean_contents()
+        # منابع کهنهٔ صفحه (تصویر اصلی حجیم) خالی شود تا در ذخیرهٔ نهایی با
+        # garbage=4 جمع‌آوری شود؛ وگرنه تصویر یتیم در /Resources می‌ماند و
+        # از حجم خروجی چیزی کم نمی‌شود.
+        try:
+            page.parent.xref_set_key(page.xref, "Resources", "<<>>")
+        except Exception:  # noqa: BLE001
+            pass
+        page.insert_image(page.rect, stream=jpg)
+    except Exception as e:  # noqa: BLE001
+        log(f"فشرده‌سازی صفحهٔ تصویری ناموفق بود (اصل حفظ شد): {e}")
 
 
 class _RateLimiter:
@@ -943,13 +1134,20 @@ def _reinsert_images(doc, page: "pymupdf.Page", imgs: list[dict], page_w: float,
         log(f"{moved} تصویر به موقعیت آینه‌ای منتقل شد.")
 
 
-def _finalize_save(doc, out_path, log=print) -> None:
+# پیش‌تنظیم کیفیت تصویر خروجی — «small» بر اساس درخواست کاربر پیش‌فرض است
+_IMGQ_PRESETS: dict[str, dict | None] = {
+    "small": {"dpi_threshold": 110, "dpi_target": 96, "quality": 60},
+    "balanced": {"dpi_threshold": 150, "dpi_target": 120, "quality": 70},
+    "high": None,
+}
+
+
+def _finalize_save(doc, out_path, log=print, img_quality: str = "small") -> None:
     """ذخیرهٔ نهایی با فشرده‌سازی کامل برای کاهش حجم فایل خروجی:
 
       ۱) subset_fonts — فقط نویسه‌های استفاده‌شده از فونت فارسی نگه داشته می‌شود
-         (فونت کامل وزیرمتن صدها کیلوبایت است؛ زیرمجموعه چند ده کیلوبایت)
-      ۲) rewrite_images — تصاویر پرچگالی (اسکن‌ها) با DPI پایین‌تر و JPEG کیفیت ۷۰
-         بازفشرده می‌شوند (فقط یک‌بار، در پایان — تکرار کیفیت را خراب می‌کند)
+      ۲) rewrite_images — تصاویر (حتی بدون‌افت DPI مثل PNG اسکرین‌شات) به JPEG
+         با کیفیت/ resolusion تنظیم‌شده بازفشرده می‌شوند؛ «small» تهاجمی‌ترین است
       ۳) save با garbage=4/clean — اشیای بلااستفاده و نسخه‌های تکراری حذف می‌شوند
     """
     try:
@@ -957,11 +1155,23 @@ def _finalize_save(doc, out_path, log=print) -> None:
         log("فشرده‌سازی فونت‌ها انجام شد.")
     except Exception as e:  # noqa: BLE001
         log(f"فشرده‌سازی فونت ناموفق بود: {e}")
-    try:
-        doc.rewrite_images(dpi_threshold=150, dpi_target=120, quality=70)
-        log("بازفشرده‌سازی تصاویر انجام شد.")
-    except Exception as e:  # noqa: BLE001
-        log(f"بازفشرده‌سازی تصاویر ناموفق بود: {e}")
+    p = _IMGQ_PRESETS.get(img_quality, _IMGQ_PRESETS["small"])
+    if p:
+        try:
+            doc.rewrite_images(dpi_threshold=p["dpi_threshold"],
+                               dpi_target=p["dpi_target"], quality=p["quality"],
+                               lossy=True, lossless=True, bitonal=True,
+                               color=True, gray=True)
+            log(f"بازفشرده‌سازی تصاویر انجام شد (کیفیت: {img_quality}).")
+        except TypeError:
+            try:  # نسخه‌های قدیمی‌تر pymupdf بدون پارامترهای تفصیلی
+                doc.rewrite_images(dpi_threshold=p["dpi_threshold"],
+                                   dpi_target=p["dpi_target"], quality=p["quality"])
+                log("بازفشرده‌سازی تصاویر انجام شد (حالت سازگار).")
+            except Exception as e:  # noqa: BLE001
+                log(f"بازفشرده‌سازی تصاویر ناموفق بود: {e}")
+        except Exception as e:  # noqa: BLE001
+            log(f"بازفشرده‌سازی تصاویر ناموفق بود: {e}")
     doc.save(str(out_path), garbage=4, deflate=True, deflate_images=True,
              deflate_fonts=True, clean=True)
 
@@ -995,7 +1205,9 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                   src_lang="auto", dst_lang="fa", use_cli=False,
                   oc_bin="opencode", oc_cwd=None,
                   start_page: int = 0, end_page: int | None = None,
-                  extract_progress=None) -> dict:
+                  extract_progress=None,
+                  page_mode: str = "auto", ocr_langs: str = "",
+                  ocr_workers: int = 3, img_quality: str = "small") -> dict:
     """
     ترجمهٔ کامل فایل PDF به زبان مقصد با حفظ چیدمان.
 
@@ -1006,6 +1218,10 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
     workers: تعداد ترجمه‌های موازی؛ spacing حداقل فاصلهٔ شروع درخواست‌ها/فراخوانی‌ها.
     start_page/end_page: بازهٔ صفحات (۰مبنا؛ انتهای بازه ساختارِ باز) — برای ترجمهٔ
     پارت‌به‌پارت و ادامه از چک‌پوینت؛ پیش‌فرض کل فایل.
+    page_mode: "text" فقط لایهٔ متن، "image" فقط OCR (اسکن/اسکرین‌شات/کامیک)،
+    "auto" — اول متن؛ اگر صفحه متن نداشت OCR.
+    img_quality: فشرده‌سازی تصاویر خروجی — "small" (پیش‌فرض، تهاجمی)،
+    "balanced"، "high" (بدون بازفشرده‌سازی).
     translator: برای تست — تابعی (segments -> translations) بدون اینترنت.
     خروجی: دیکشنری آمار شامل usage (مصرف توکن ورودی/خروجی/مجموع و تعداد درخواست‌ها).
     """
@@ -1039,7 +1255,7 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
     usage_lock = threading.Lock()
     limiter = _RateLimiter(spacing if workers > 1 else 0.0)
     stats = {"pages": total_all, "range_start": p_start, "range_end": p_end,
-             "translated": 0, "no_text_pages": 0,
+             "translated": 0, "no_text_pages": 0, "ocr_pages": 0,
              "failed_pages": [], "skipped_pages": [],
              "output": str(out_path), "cancelled": False,
              "usage": usage}
@@ -1064,8 +1280,77 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
         pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="tr")
         log(f"ترجمهٔ موازی فعال شد: {workers} ورکر، فاصلهٔ شروع درخواست‌ها {spacing:.1f} ثانیه.")
 
-    # (pno, blocks, segs, trans, tasks) — tasks: [(batch, Future|None), ...]
-    page_jobs: list[tuple[int, list, list, list, list]] = []
+    # کارهای صفحه: دیکشنری {pno, blocks, segs, trans, tasks, fut}
+    # fut: فاتور OCR برای صفحات تصویری (قبل از فاز ۲ حل می‌شود)
+    page_jobs: list[dict] = []
+
+    # کش سگمنت‌های ترجمه‌شدهٔ همین اجرا — سرصفحه/پاصفحه و جمله‌های تکراری کتاب‌ها
+    # دوباره ترجمه نمی‌شوند (سرعت به‌طور محسوس بالاتر).
+    # seg_cache: نتیجهٔ نهایی؛ pending: سگمنت در-flight → (Future، اندیس در خروجی بچ)
+    seg_cache: dict[str, str] = {}
+    pending: dict[str, tuple] = {}
+    cache_lock = threading.Lock()
+
+    # OCR: فقط وقتی لازم است (حالت عکس‌محور/خودکار) و tesseract در دسترس باشد
+    ocr_pool: ThreadPoolExecutor | None = None
+    tess_langs = (ocr_langs or "").strip() or tess_lang_for(src_lang)
+    want_ocr = page_mode in ("auto", "image") and ocr_available()
+    if page_mode == "image" and not ocr_available():
+        log("هشدار: tesseract نصب نیست؛ حالت عکس‌محور به حالت خودکار برمی‌گردد.")
+    if want_ocr and page_mode == "image":
+        log(f"حالت عکس‌محور: متن صفحات با OCR ({tess_langs}) استخراج می‌شود…")
+    if want_ocr:
+        ocr_pool = ThreadPoolExecutor(max_workers=max(1, min(ocr_workers, 4)),
+                                      thread_name_prefix="ocr")
+
+    def _enqueue_page(pno: int, blocks: list[dict]) -> dict:
+        """ساخت کار صفحه: کش/اعداد خالص حذف و بچ‌های ترجمه صف می‌شوند.
+        سگمنت تکراری (مثل سرصفحهٔ یکسان صفحات) اگر بچ در-flight یا نتیجه‌شده
+        داشته باشد، دوباره ارسال نمی‌شود و از همان نتیجه کپی می‌شود (xrefs)."""
+        segs = [b["text"] for b in blocks]
+        trans = [""] * len(segs)
+        items = []
+        xrefs = []   # (اندیس در صفحه، Future بچ دیگر، اندیس در خروجی آن بچ)
+        for i, s in enumerate(segs):
+            st = s.strip()
+            if not st:
+                continue
+            if _PURE_NUM_RE.match(st):
+                trans[i] = s  # اعداد و علائم خالص (مثل شمارهٔ صفحه) نیازی به ترجمه ندارند
+                continue
+            with cache_lock:
+                hit = seg_cache.get(st)
+                pend = pending.get(st)
+            if hit is not None:
+                trans[i] = hit
+                continue
+            if pend is not None:
+                xrefs.append((i, pend[0], pend[1]))
+                continue
+            items.append((i, s))
+
+        if translator is not None:
+            # حالت تست: مترجم موک — از همان مسیر کش می‌گذرد تا تست‌ها
+            # دقیقاً رفتار مسیر واقعی را ببینند.
+            got = [str(t) for t in translator([s for _, s in items])]
+            got = got + [""] * max(len(items) - len(got), 0)
+            for (i, s), tr in zip(items, got):
+                trans[i] = tr
+                if s and len(s) > 6:
+                    with cache_lock:
+                        seg_cache[s.strip()] = tr
+            return {"pno": pno, "blocks": blocks, "segs": segs, "trans": trans,
+                    "tasks": [], "xrefs": xrefs}
+
+        tasks = []
+        for batch in _batch_items(items):
+            fut = pool.submit(_call_batch, batch) if pool is not None else None
+            for out_idx, (_i, s) in enumerate(batch):
+                with cache_lock:
+                    pending.setdefault(s.strip(), (fut, out_idx))
+            tasks.append((batch, fut))
+        return {"pno": pno, "blocks": blocks, "segs": segs, "trans": trans,
+                "tasks": tasks, "xrefs": xrefs}
 
     try:
         # ── فاز ۱: استخراج صفحات و صف‌کردن بچ‌های ترجمه؛ ترجمهٔ صفحات بعدی
@@ -1080,10 +1365,19 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
             try:
                 page = doc[pno]
                 blocks = extract_blocks(page)
+                if page_mode == "image" and ocr_pool is not None:
+                    # کاربر گفته عکس‌محور است؛ OCR اولویت دارد (لایهٔ متن، پشتیبان می‌ماند)
+                    fut = ocr_pool.submit(ocr_page_blocks, page, tess_langs, 200, log)
+                    page_jobs.append({"pno": pno, "fut": fut, "text_fallback": blocks})
+                    continue
+                if not blocks and page_mode == "auto" and ocr_pool is not None:
+                    fut = ocr_pool.submit(ocr_page_blocks, page, tess_langs, 200, log)
+                    page_jobs.append({"pno": pno, "fut": fut, "text_fallback": []})
+                    continue
                 if not blocks:
                     stats["no_text_pages"] += 1
                     log(f"صفحهٔ {pno + 1}: متن قابل استخراج نداشت (تصویری است؟) — بدون تغییر کپی شد.")
-                    page_jobs.append((pno, [], [], [], []))
+                    page_jobs.append({"pno": pno, "blocks": [], "segs": [], "trans": [], "tasks": []})
                     continue
                 # جلوگیری از «متن روی متن»: بلوک‌های همپوشان ادغام می‌شوند
                 blocks = _merge_overlapping_blocks(blocks)
@@ -1092,31 +1386,7 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                 # جهت متن (راست‌چین/چپ‌چین) بر اساس زبان مقصد
                 for b in blocks:
                     b["_rtl"] = rtl
-
-                segs = [b["text"] for b in blocks]
-                trans = [""] * len(segs)
-
-                if translator is not None:
-                    # حالت تست: ترجمهٔ ساختگی
-                    got = [str(t) for t in translator(segs)]
-                    trans = got + segs[len(got):]
-                    page_jobs.append((pno, blocks, segs, trans, []))
-                    continue
-
-                # اعداد و علائم خالص (مثل شمارهٔ صفحه) نیازی به ترجمه ندارند
-                items = [(i, s) for i, s in enumerate(segs)
-                         if s.strip() and not _PURE_NUM_RE.match(s.strip())]
-                for idx, s in enumerate(segs):
-                    if _PURE_NUM_RE.match(s.strip() or "x0x"):
-                        trans[idx] = s
-
-                tasks = []
-                for batch in _batch_items(items):
-                    if pool is not None:
-                        tasks.append((batch, pool.submit(_call_batch, batch)))
-                    else:
-                        tasks.append((batch, None))
-                page_jobs.append((pno, blocks, segs, trans, tasks))
+                page_jobs.append(_enqueue_page(pno, blocks))
             except FatalTranslationError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -1124,13 +1394,40 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                 stats["skipped_pages"].append(pno + 1)
                 log(f"صفحهٔ {pno + 1}: خطا در استخراج متن ({e}) — بدون تغییر کپی شد.")
                 log(traceback.format_exc())
-                page_jobs.append((pno, [], [], [], []))
+                page_jobs.append({"pno": pno, "blocks": [], "segs": [], "trans": [], "tasks": []})
                 continue
             finally:
                 extract_progress(pno - p_start + 1, total)
 
+        # ── فاز ۱٫۵: حل نتایج OCR صفحات تصویری
+        resolved: list[dict] = []
+        for pj in page_jobs:
+            if pj.get("fut") is None:
+                resolved.append(pj)
+                continue
+            pno = pj["pno"]
+            try:
+                oblocks = pj["fut"].result()
+            except Exception as e:  # noqa: BLE001
+                log(f"صفحهٔ {pno + 1}: خطای OCR ({e}) — بدون تغییر کپی می‌شود.")
+                oblocks = []
+            if oblocks:
+                stats["ocr_pages"] += 1
+                for b in oblocks:
+                    b["_rtl"] = rtl
+                resolved.append(_enqueue_page(pno, oblocks))
+            elif pj.get("text_fallback"):
+                resolved.append(_enqueue_page(pno, pj["text_fallback"]))
+            else:
+                stats["no_text_pages"] += 1
+                log(f"صفحهٔ {pno + 1}: نه متن قابل استخراج داشت و نه OCR چیزی پیدا کرد — کپی شد.")
+                resolved.append({"pno": pno, "blocks": [], "segs": [], "trans": [], "tasks": []})
+        page_jobs = resolved
+
         # ── فاز ۲: بازسازی صفحات به ترتیب؛ نتیجهٔ هر بچ گرفته و درج می‌شود
-        for pno, blocks, segs, trans, tasks in page_jobs:
+        for pj in page_jobs:
+            pno, blocks, segs, trans, tasks = (pj["pno"], pj["blocks"], pj["segs"],
+                                               pj["trans"], pj["tasks"])
             if cancelled is not None and cancelled.is_set():
                 stats["cancelled"] = True
                 log("لغو شد؛ پیشرفت فعلی ذخیره می‌شود…")
@@ -1159,28 +1456,66 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                         log(traceback.format_exc())
                         outs = None
                     if outs is not None:
-                        for (idx, _), tr in zip(batch, outs):
+                        for (idx, src_seg), tr in zip(batch, outs):
                             trans[idx] = tr
+                            if src_seg and len(src_seg) > 6:
+                                with cache_lock:
+                                    seg_cache[src_seg.strip()] = tr
+                # سگمنت‌های مشترک با بچ صفحات قبل (سرصفحهٔ تکراری و…)
+                for i, xf, out_idx in pj.get("xrefs") or []:
+                    try:
+                        xouts = xf.result() if xf is not None else None
+                    except Exception:  # noqa: BLE001
+                        xouts = None
+                    if xouts is not None and out_idx < len(xouts):
+                        trans[i] = xouts[out_idx]
+                        continue
+                    # بچ بدون پول (حالت ترتیبی) — نتیجه تا این لحظه در کش است
+                    with cache_lock:
+                        hit = seg_cache.get((segs[i] or "").strip())
+                    if hit is not None:
+                        trans[i] = hit
 
-                # ۱) حذف متن اصلی صفحه (تصاویر و گرافیک دست‌نخورده می‌مانند)
-                for b in blocks:
-                    for r in b["line_rects"]:
-                        pr = pymupdf.Rect(r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 0.5)
-                        page.add_redact_annot(pr, fill=False)
-                _apply_redactions(page)
+                ocr_page = all(b.get("_ocr") for b in blocks)
+
+                # ۱) حذف متن اصلی صفحه
+                if ocr_page:
+                    # متن داخل تصویر است: فشرده‌سازی شدید صفحه + پوشش هم‌رنگِ محل متن
+                    if img_quality != "high":
+                        _rasterize_page(page, 100 if img_quality == "small" else 120,
+                                        60 if img_quality == "small" else 70, log)
+                    for b in blocks:
+                        fr = pymupdf.Rect(b["bbox"].x0 - 1.0, b["bbox"].y0 - 1.0,
+                                          b["bbox"].x1 + 1.0, b["bbox"].y1 + 1.0)
+                        fr.intersect(page.rect)
+                        if fr.is_empty or fr.width <= 1 or fr.height <= 1:
+                            continue
+                        try:
+                            page.draw_rect(fr, color=None, fill=b.get("_fill") or (1, 1, 1))
+                        except Exception:  # noqa: BLE001
+                            pass
+                else:
+                    # حذف متن اصلی صفحه (تصاویر و گرافیک دست‌نخورده می‌مانند)
+                    for b in blocks:
+                        for r in b["line_rects"]:
+                            pr = pymupdf.Rect(r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 0.5)
+                            page.add_redact_annot(pr, fill=False)
+                    _apply_redactions(page)
 
                 # ۲) کادرهای هدف: با آینه‌سازی افقی، متن چپ‌چین انگلیسی به موقعیت متقارنِ راست می‌رود
+                #    (صفحات عکس‌محور/OCR قابل آینه‌شدن نیستند — تصویر سر جایش می‌ماند)
                 page_w = page.rect.width
+                page_mirror = mirror and not ocr_page
                 rects = []
                 for b in blocks:
                     r = b["bbox"]
-                    if mirror:
+                    if page_mirror:
                         r = _mirror_rect(b["bbox"], page_w)
                     rects.append(r)
 
                 # ۲٫۵) آینه‌سازی محتوای گرافیکی: جدول‌ها/کادرها/خطوط با متن هم‌تراز می‌شوند و
                 #      تصاویر به موقعیت آینه‌ای منتقل می‌شوند (بدون برعکس‌شدن محتوای خودشان)
-                if mirror and _page_flippable(page):
+                if page_mirror and _page_flippable(page):
                     try:
                         imgs = _collect_images(page)
                         if imgs:
@@ -1257,7 +1592,9 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
             if pool is None and translator is None and delay and pno + 1 < p_end:
                 time.sleep(delay)
     finally:
-        # بستن استخر: کارهای در صف لغو می‌شوند؛ حداکثر «workers» درخواستِ در جریان تمام می‌شود
+        # بستن استخرها: کارهای در صف لغو می‌شوند؛ حداکثر «workers» درخواستِ در جریان تمام می‌شود
+        if ocr_pool is not None:
+            ocr_pool.shutdown(wait=False, cancel_futures=True)
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
 
@@ -1269,7 +1606,7 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
 
     if stats["cancelled"]:
         try:
-            _finalize_save(doc, tmp_path, log)
+            _finalize_save(doc, tmp_path, log, img_quality)
         except Exception as e:  # noqa: BLE001
             log(f"ذخیرهٔ نهایی ناتمام ناموفق بود ({e})؛ ذخیرهٔ ساده…")
             try:
@@ -1279,7 +1616,7 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
         stats["output"] = str(tmp_path)
     else:
         try:
-            _finalize_save(doc, out_path, log)
+            _finalize_save(doc, out_path, log, img_quality)
         except Exception as e:  # noqa: BLE001
             log(f"ذخیرهٔ نهایی ناموفق بود ({e})؛ ذخیرهٔ ساده…")
             try:
@@ -1291,7 +1628,8 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
     doc.close()
 
     dt = time.time() - t0
-    log(f"پایان: {stats['translated']} از {total} صفحه در {dt:.0f} ثانیه پردازش شد. "
+    ocr_note = f" | OCR: {stats['ocr_pages']} صفحه" if stats.get("ocr_pages") else ""
+    log(f"پایان: {stats['translated']} از {total} صفحه در {dt:.0f} ثانیه پردازش شد{ocr_note}. "
         f"خروجی: {stats['output']}")
     if usage:
         log(f"مصرف توکن: ورودی {usage.get('prompt_tokens', 0):,} | "
@@ -1322,6 +1660,10 @@ if __name__ == "__main__":
     ap.add_argument("--use-cli", action="store_true",
                     help="ترجمه با CLI اوپن‌کد به‌جای وب‌سرویس سازگار OpenAI")
     ap.add_argument("--oc-bin", default="opencode", help="مسیر باینری opencode")
+    ap.add_argument("--page-mode", default="auto", choices=["auto", "text", "image"],
+                    help="حالت صفحه: text (لایهٔ متن)، image (OCR)، auto")
+    ap.add_argument("--img-quality", default="small", choices=["small", "balanced", "high"],
+                    help="کیفیت/حجم تصاویر خروجی")
     a = ap.parse_args()
 
     _key = a.api_key or ""
@@ -1341,6 +1683,7 @@ if __name__ == "__main__":
                   base_url=a.base_url, workers=max(1, a.workers),
                   src_lang=a.src_lang, dst_lang=a.dst_lang,
                   use_cli=a.use_cli, oc_bin=a.oc_bin,
+                  page_mode=a.page_mode, img_quality=a.img_quality,
                   progress=lambda d, t: print(f"صفحه {d}/{t}", end="\r", flush=True),
                   log=print)
     print()

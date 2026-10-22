@@ -3,24 +3,26 @@
 """ذخیره‌سازی چک‌پوینت‌های ترجمه بین چرخه‌های GitHub Actions
 ---------------------------------------------------------
 فایل‌های بزرگ (PDF ورودی + خروجی ناتمام) نمی‌توانند در گیت کامیت شوند؛
-پس بین چرخه‌ها با این ماژول ذخیره می‌شوند:
+پس بین چرخه‌ها روی «Release asset» ذخیره می‌شوند:
 
-  مسیر ۱ (اصلی): Artifact API — POST /runs/{id}/artifacts و PUT فایل zip
-  مسیر ۲ (پشتیبان): Release asset — ساخت release موقت با تگ cp-... و آپلود asset
+  • هر چک‌پوینت = یک release موقت با تگ یکتا (cp-<hash>-in / cp-<hash>-pp)
+  • سقف هر asset ~۲GB است (هم‌سقف MTProto) و منقضی نمی‌شود
+  • آپلود/دانلود استریمی است (فایل چندصد مگابایتی حافظه را نمی‌گیرد)
+  • آپلودِ تگِ تکراری = جایگزینی کامل (release قبلی پاک می‌شود)
 
-هر دو مسیر با توکن GITHUB_TOKEN خودِ ورک‌فلو (actions:write / contents:write) کار می‌کنند.
-پس از بازیابی در چرخهٔ بعد، چک‌پوینت حذف می‌شود (cleanup_checkpoint).
+قبلاً از Artifact API استفاده می‌شد که دو ایراد داشت: آپلود zip در حافظه
+و وابستگی به run جاری — برای فایل‌های سنگین کند و شکست‌پذیر بود.
 """
 
 from __future__ import annotations
 
-import io
-import json
+import hashlib
 import time
-import zipfile
 from pathlib import Path
 
 import requests
+
+_CHUNK = 1024 * 1024
 
 
 def _hdr(token: str) -> dict:
@@ -32,219 +34,115 @@ def _api(repo: str) -> str:
     return f"https://api.github.com/repos/{repo}"
 
 
-def build_zip(files: dict[str, Path], dst: Path) -> Path:
-    """ساخت zip از فایل‌های چک‌پوینت (نام در zip ← مسیر واقعی)."""
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as z:
-        for arc, p in files.items():
-            z.write(p, arcname=arc)
-    return dst
+def anon_tag(jobkey: str, kind: str) -> str:
+    """تگ یکتا و بدون آیدی کاربر برای ریپوی عمومی: cp-<sha1[:16]>-in/-pp"""
+    h = hashlib.sha1(str(jobkey).encode("utf-8")).hexdigest()[:16]
+    return f"cp-{h}-{kind}"
 
 
-def _extract_zip(data: bytes, dest_dir: Path) -> None:
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
-        for info in z.infolist():
-            if info.is_dir():
-                continue
-            name = Path(info.filename).name  # مسیرهای تودرتو را صاف کن
-            (dest_dir / name).write_bytes(z.read(info))
-
-
-# --------------------------------------------------------------------------
-# مسیر ۱: Artifact API
-# --------------------------------------------------------------------------
-
-def _upload_artifact(repo: str, token: str, run_id: int, name: str,
-                     zip_path: Path, log=print) -> int:
-    """آپلود zip به‌عنوان artifact متعلق به run جاری؛ id را برمی‌گرداند."""
+def _delete_release_by_tag(repo: str, token: str, tag: str) -> None:
     api = _api(repo)
-    r = requests.post(f"{api}/actions/runs/{run_id}/artifacts", headers=_hdr(token),
-                      json={"name": name}, timeout=30)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"artifact create {r.status_code}: {r.text[:160]}")
-    up = ""
     try:
-        j = r.json() or {}
-        up = j.get("upload_url") or j.get("archive_upload_url") or ""
+        r = requests.get(f"{api}/releases/tags/{tag}", headers=_hdr(token), timeout=30)
+        if r.status_code == 200:
+            requests.delete(f"{api}/releases/{r.json()['id']}",
+                            headers=_hdr(token), timeout=30)
+            time.sleep(0.5)
     except Exception:  # noqa: BLE001
         pass
-    if not up:
-        up = r.headers.get("Location", "")
-    if not up:
-        raise RuntimeError("artifact upload_url دریافت نشد")
-    data = zip_path.read_bytes()
-    r2 = requests.put(up, headers={"Authorization": f"Bearer {token}",
-                                   "Content-Type": "application/zip",
-                                   "Content-Length": str(len(data))},
-                      data=data, timeout=1800)
-    if r2.status_code not in (200, 201):
-        raise RuntimeError(f"artifact upload {r2.status_code}: {r2.text[:160]}")
-    # id را از لیست پیدا کن (ثبت گاهی چند ثانیه طول می‌کشد)
-    for _ in range(10):
-        lst = requests.get(f"{api}/actions/runs/{run_id}/artifacts?per_page=100",
-                           headers=_hdr(token), timeout=30).json()
-        for a in lst.get("artifacts", []):
-            if a.get("name") == name:
-                log(f"artifact {a['id']} آپلود شد ({zip_path.stat().st_size / 1e6:.1f}MB).")
-                return int(a["id"])
-        time.sleep(2)
-    raise RuntimeError("artifact پس از آپلود در لیست پیدا نشد")
-
-
-def _download_artifact(repo: str, token: str, art_id: int, dest_dir: Path,
-                       log=print) -> bool:
-    api = _api(repo)
-    meta = requests.get(f"{api}/actions/artifacts/{art_id}", headers=_hdr(token),
-                        timeout=30)
-    if meta.status_code != 200:
-        log(f"artifact {art_id} پیدا نشد ({meta.status_code}).")
-        return False
-    if meta.json().get("expired"):
-        log("artifact منقضی شده است.")
-        return False
-    url = meta.json().get("archive_download_url")
-    if not url:
-        return False
-    r = requests.get(url, headers=_hdr(token), timeout=3600)
-    if r.status_code != 200:
-        log(f"دانلود artifact ناموفق ({r.status_code}).")
-        return False
-    _extract_zip(r.content, dest_dir)
-    log(f"artifact {art_id} بازیابی شد → {dest_dir}")
-    return True
-
-
-def _delete_artifact(repo: str, token: str, art_id: int) -> None:
-    try:
-        requests.delete(f"{_api(repo)}/actions/artifacts/{art_id}",
-                        headers=_hdr(token), timeout=30)
+    try:  # تگ یتیم هم پاک شود
+        requests.delete(f"{api}/git/refs/tags/{tag}", headers=_hdr(token), timeout=30)
     except Exception:  # noqa: BLE001
         pass
 
 
-# --------------------------------------------------------------------------
-# مسیر ۲: Release asset (پشتیبان)
-# --------------------------------------------------------------------------
-
-def _upload_release(repo: str, token: str, name: str, zip_path: Path,
-                    branch: str = "main") -> str:
-    """release موقت با تگ=name و یک asset zip؛ «release:<tag>:<asset_id>» برمی‌گرداند."""
+def upload_release_file(repo: str, token: str, tag: str, fname: str, src: Path,
+                        *, branch: str = "main", log=print) -> str:
+    """آپلود یک فایل به‌عنوان asset یک release با تگ داده‌شده (جایگزینی کامل).
+    مرجع ذخیره‌شده «rel:<tag>» است. نام asset = نام فایل (in.pdf / partial.pdf)."""
+    src = Path(src)
+    if not src.exists() or src.stat().st_size == 0:
+        raise RuntimeError(f"فایل برای آپلود پیدا نشد: {src}")
     api = _api(repo)
-    data = zip_path.read_bytes()
-    # اگر release قبلی با همین تگ مانده، اول پاکش کن
-    old = requests.get(f"{api}/releases/tags/{name}", headers=_hdr(token), timeout=30)
-    if old.status_code == 200:
-        requests.delete(f"{api}/releases/{old.json()['id']}", headers=_hdr(token),
-                        timeout=30)
-        time.sleep(1)
-        try:  # تگ یتیم را هم پاک کن
-            requests.delete(f"{api}/git/refs/tags/{name}", headers=_hdr(token),
-                            timeout=30)
-        except Exception:  # noqa: BLE001
-            pass
+    _delete_release_by_tag(repo, token, tag)
     r = requests.post(f"{api}/releases", headers=_hdr(token), timeout=30, json={
-        "tag_name": name, "target_commitish": branch, "name": name,
+        "tag_name": tag, "target_commitish": branch, "name": tag,
         "body": "checkpoint (auto)", "prerelease": True})
     if r.status_code not in (200, 201):
         raise RuntimeError(f"release create {r.status_code}: {r.text[:160]}")
     rel_id = r.json()["id"]
-    r2 = requests.post(
-        f"https://uploads.github.com/repos/{repo}/releases/{rel_id}/assets"
-        f"?name=checkpoint.zip",
-        headers={"Authorization": f"Bearer {token}",
-                 "Content-Type": "application/zip",
-                 "Content-Length": str(len(data))},
-        data=data, timeout=3600)
+    size = src.stat().st_size
+    with open(src, "rb") as fh:  # آپلود استریمی — حافظه را اشغال نمی‌کند
+        r2 = requests.post(
+            f"https://uploads.github.com/repos/{repo}/releases/{rel_id}/assets"
+            f"?name={fname}",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/octet-stream",
+                     "Content-Length": str(size)},
+            data=fh, timeout=7200)
     if r2.status_code not in (200, 201):
         raise RuntimeError(f"release asset upload {r2.status_code}: {r2.text[:160]}")
-    return f"release:{name}:{r2.json()['id']}"
+    log(f"چک‌پوینت آپلود شد: {tag}/{fname} ({size / 1e6:.1f}MB).")
+    return f"rel:{tag}"
 
 
-def _download_release(repo: str, token: str, tag: str, dest_dir: Path,
-                      log=print) -> bool:
-    r = requests.get(f"{_api(repo)}/releases/tags/{tag}", headers=_hdr(token),
-                     timeout=30)
-    if r.status_code != 200:
-        log(f"release {tag} پیدا نشد ({r.status_code}).")
+def download_release_file(repo: str, token: str, ref: str, dest_dir: Path,
+                          *, fname: str = "", log=print) -> bool:
+    """دانلود استریمی asset از مرجع «rel:<tag>» به dest_dir/<نام asset>."""
+    if not ref.startswith("rel:"):
         return False
-    assets = r.json().get("assets") or []
-    if not assets:
-        return False
-    a = assets[0]
-    r2 = requests.get(f"{_api(repo)}/releases/assets/{a['id']}",
-                      headers={**_hdr(token), "Accept": "application/octet-stream"},
-                      timeout=3600)
-    if r2.status_code != 200:
-        log(f"دانلود asset ناموفق ({r2.status_code}).")
-        return False
-    _extract_zip(r2.content, dest_dir)
-    log(f"release asset بازیابی شد → {dest_dir}")
-    return True
-
-
-def _delete_release(repo: str, token: str, tag: str) -> None:
+    tag = ref.split(":", 1)[1]
+    dest_dir = Path(dest_dir)
     try:
         r = requests.get(f"{_api(repo)}/releases/tags/{tag}", headers=_hdr(token),
                          timeout=30)
-        if r.status_code == 200:
-            requests.delete(f"{_api(repo)}/releases/{r.json()['id']}",
-                            headers=_hdr(token), timeout=30)
-        requests.delete(f"{_api(repo)}/git/refs/tags/{tag}", headers=_hdr(token),
-                        timeout=30)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-# --------------------------------------------------------------------------
-# رابط عمومی
-# --------------------------------------------------------------------------
-
-def upload_checkpoint(repo: str, token: str, run_id: int, name: str,
-                      files: dict[str, Path], *, branch: str = "main",
-                      workdir: Path | None = None, log=print) -> str:
-    """آپلود چک‌پوینت؛ مرجع آن (artifact:<id> یا release:<tag>:<aid>) برمی‌گردد."""
-    tmp = (workdir or Path("data/tmp")) / f"{name}.zip"
-    build_zip(files, tmp)
-    try:
-        if run_id:
-            art = _upload_artifact(repo, token, run_id, name, tmp, log=log)
+        if r.status_code != 200:
+            log(f"release {tag} پیدا نشد ({r.status_code}).")
+            return False
+        assets = r.json().get("assets") or []
+        if fname:
+            assets = [a for a in assets if a.get("name") == fname]
+        if not assets:
+            log(f"asset در release {tag} نبود.")
+            return False
+        a = assets[0]
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out = dest_dir / (a.get("name") or fname or "checkpoint.bin")
+        tmp = out.with_suffix(out.suffix + ".part")
+        r2 = requests.get(f"{_api(repo)}/releases/assets/{a['id']}",
+                          headers={**_hdr(token), "Accept": "application/octet-stream"},
+                          stream=True, timeout=7200)
+        if r2.status_code != 200:
+            log(f"دانلود asset ناموفق ({r2.status_code}).")
+            return False
+        n = 0
+        with open(tmp, "wb") as fh:
+            for chunk in r2.iter_content(chunk_size=_CHUNK):
+                if chunk:
+                    fh.write(chunk)
+                    n += len(chunk)
+        if n != int(a.get("size") or n):
+            log(f"حجم دانلودشده ({n}) با asset ({a.get('size')}) یکی نبود.")
             tmp.unlink(missing_ok=True)
-            return f"artifact:{art}"
-        raise RuntimeError("run_id در دسترس نیست")
-    except Exception as e:  # noqa: BLE001
-        log(f"مسیر Artifact ناموفق بود ({e})؛ مسیر Release امتحان می‌شود…")
-        try:
-            ref = _upload_release(repo, token, name, tmp, branch=branch)
-            tmp.unlink(missing_ok=True)
-            log(f"چک‌پوینت به‌صورت release ذخیره شد: {ref}")
-            return ref
-        except Exception as e2:  # noqa: BLE001
-            log(f"مسیر Release هم ناموفق بود: {e2}")
-            tmp.unlink(missing_ok=True)
-            return ""
-
-
-def download_checkpoint(repo: str, token: str, ref: str, dest_dir: Path,
-                        log=print) -> bool:
-    """بازیابی چک‌پوینت از مرجع ذخیره‌شده به dest_dir."""
-    try:
-        if ref.startswith("artifact:"):
-            return _download_artifact(repo, token, int(ref.split(":", 1)[1]),
-                                      dest_dir, log=log)
-        if ref.startswith("release:"):
-            parts = ref.split(":")
-            return _download_release(repo, token, parts[1], dest_dir, log=log)
+            return False
+        tmp.replace(out)
+        log(f"چک‌پوینت بازیابی شد: {out.name} ({n / 1e6:.1f}MB).")
+        return True
     except Exception as e:  # noqa: BLE001
         log(f"بازیابی چک‌پوینت ناموفق بود: {e}")
-    return False
+        return False
 
 
-def cleanup_checkpoint(repo: str, token: str, ref: str) -> None:
-    try:
-        if ref.startswith("artifact:"):
-            _delete_artifact(repo, token, int(ref.split(":", 1)[1]))
-        elif ref.startswith("release:"):
-            _delete_release(repo, token, ref.split(":")[1])
-    except Exception:  # noqa: BLE001
-        pass
+def cleanup_release(repo: str, token: str, ref: str, *, log=print) -> None:
+    """حذف release/تگ مرجع داده‌شده."""
+    if not ref or not ref.startswith("rel:"):
+        return
+    tag = ref.split(":", 1)[1]
+    _delete_release_by_tag(repo, token, tag)
+    log(f"چک‌پوینت پاک شد: {tag}.")
+
+
+# سازگاری با نام‌های قدیمی (اگر جایی استفاده شده باشد)
+upload_checkpoint = None
+download_checkpoint = None
+cleanup_checkpoint = None

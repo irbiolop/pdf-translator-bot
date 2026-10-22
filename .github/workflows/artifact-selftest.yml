@@ -1,4 +1,4 @@
-name: Artifact selftest
+name: Store selftest
 
 on:
   workflow_dispatch:
@@ -18,38 +18,46 @@ jobs:
           python-version: "3.11"
       - name: Install deps
         run: pip install requests
-      - name: Round-trip test
+      - name: Release-store round-trip test
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPO: ${{ github.repository }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           python - <<'PY'
-          import json, os, time
+          import os, time
           from pathlib import Path
           import gh_store
 
           repo = os.environ["GITHUB_REPO"]
           tok = os.environ["GITHUB_TOKEN"]
-          run_id = int(os.environ.get("GITHUB_RUN_ID", "0") or 0)
-          name = f"cp-selftest-{int(time.time())}"
+          tag = gh_store.anon_tag(f"selftest-{int(time.time())}", "pp")
           src = Path("data/cp/selftest"); src.mkdir(parents=True, exist_ok=True)
-          (src / "meta.json").write_text(json.dumps({"hello": "checkpoint", "ts": time.time()}), encoding="utf-8")
-          (src / "blob.bin").write_bytes(os.urandom(3_000_000))
+          (src / "partial.pdf").write_bytes(os.urandom(3_000_000))
 
-          ref = gh_store.upload_checkpoint(repo, tok, run_id, name,
-                  {"meta.json": src / "meta.json", "blob.bin": src / "blob.bin"})
+          ref = gh_store.upload_release_file(repo, tok, tag, "partial.pdf",
+                                             src / "partial.pdf")
           print("REF =", ref)
-          assert ref, "upload failed"
+          assert ref.startswith("rel:"), "upload failed"
 
           dst = Path("data/cp/restored")
-          ok = gh_store.download_checkpoint(repo, tok, ref, dst)
+          ok = gh_store.download_release_file(repo, tok, ref, dst, fname="partial.pdf")
           print("DOWNLOAD OK =", ok)
           assert ok
-          a = (src / "blob.bin").read_bytes(); b = (dst / "blob.bin").read_bytes()
+          a = (src / "partial.pdf").read_bytes(); b = (dst / "partial.pdf").read_bytes()
           print("SIZE match:", len(a) == len(b), "| BYTES match:", a == b)
           assert a == b
 
-          gh_store.cleanup_checkpoint(repo, tok, ref)
+          # جایگزینی کامل (آپلود دوباره روی همان تگ) — الگوی چک‌پوینت‌های بعدی
+          (src / "partial.pdf").write_bytes(os.urandom(1_000_000))
+          ref2 = gh_store.upload_release_file(repo, tok, tag, "partial.pdf",
+                                              src / "partial.pdf")
+          dst2 = Path("data/cp/restored2")
+          assert gh_store.download_release_file(repo, tok, ref2, dst2, fname="partial.pdf")
+          assert (dst2 / "partial.pdf").stat().st_size == 1_000_000
+          print("REPLACE OK")
+
+          gh_store.cleanup_release(repo, tok, ref2)
+          assert not gh_store.download_release_file(repo, tok, ref2, Path("data/cp/x3"),
+                                                    fname="partial.pdf")
           print("SELFTEST PASSED ✅")
           PY

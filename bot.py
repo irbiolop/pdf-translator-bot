@@ -79,8 +79,8 @@ TMP_DIR = Path("data/tmp")
 # سرعت ترجمه: (تعداد فراخوانی همزمانِ opencode، فاصلهٔ شروع فراخوانی‌ها به ثانیه)
 # موازی‌سازی فقط «زمان انتظار» را پنهان می‌کند؛ فاصله‌گذارِ نرخ مشترک است و
 # الگوی مصرف در سقف RPM معقول می‌ماند (ضد بن).
-SPEEDS_OC = {"fast": (6, 1.5), "balanced": (4, 2.5), "safe": (2, 6.0)}
-SPEED_LABELS_OC = {"fast": "موازی ×۶ — سریع‌ترین", "balanced": "موازی ×۴ — متعادل",
+SPEEDS_OC = {"fast": (10, 1.0), "balanced": (6, 2.0), "safe": (2, 6.0)}
+SPEED_LABELS_OC = {"fast": "موازی ×۱۰ — سریع‌ترین", "balanced": "موازی ×۶ — متعادل",
                    "safe": "موازی ×۲ — محتاط"}
 SPEED_ORDER = ["fast", "balanced", "safe"]
 
@@ -132,7 +132,7 @@ MAX_MTPROTO = 1900 * 1024 * 1024  # سقف منطقی فایل با MTProto (~۲
 MAX_QUEUE = 6                     # حداکثر فایل در صف
 # تخمین زمان ترجمه به‌ازای هر صفحه (ثانیه؛ شامل استخراج و بازسازی PDF).
 # فقط برای هشدار زمانی استفاده می‌شود؛ با چک‌پوینت، فایل‌های بزرگ دیگر رد نمی‌شوند.
-SEC_PER_PAGE_EST = float(os.environ.get("SEC_PER_PAGE_EST", "4.0") or 4.0)
+SEC_PER_PAGE_EST = float(os.environ.get("SEC_PER_PAGE_EST", "2.5") or 2.5)
 JOB_HARD_MINUTES = float(os.environ.get("JOB_HARD_MINUTES", "345") or 345)  # سقف timeout-minutes ورک‌فلو منهای حاشیه
 # مهلت «تخلیهٔ طبیعی» در پایان چرخه؛ بعد از آن کارِ در جریان توقف موقت و چک‌پوینت می‌شود
 DRAIN_GRACE_MINUTES = float(os.environ.get("DRAIN_GRACE_MINUTES", "45") or 45)
@@ -140,6 +140,8 @@ DRAIN_GRACE_MINUTES = float(os.environ.get("DRAIN_GRACE_MINUTES", "45") or 45)
 RANGE_ASK_MIN = int(os.environ.get("RANGE_ASK_MIN", "15") or 15)
 # مهلت پاسخ به سوال انتخاب بازه (ثانیه)؛ بی‌پاسخ = کل فایل
 RANGE_WAIT_SEC = int(os.environ.get("RANGE_WAIT_SEC", "480") or 480)
+# مهلت پاسخ به سوال «متن‌محور یا عکس‌محور» برای فایل‌های کوچک (ثانیه)
+MODE_WAIT_SEC = int(os.environ.get("MODE_WAIT_SEC", "45") or 45)
 RUN_ID = int(os.environ.get("GITHUB_RUN_ID", "0") or 0)   # برای آپلود artifact چک‌پوینت
 CP_DIR = Path("data/cp")
 MIN_CYCLE_LEFT_MIN = 10.0  # اگر کمتر از این تا پایان چرخه مانده، کار تازه صفِ چرخهٔ بعد می‌شود
@@ -162,6 +164,9 @@ active_jobs: dict[str, dict] = {}
 # پاسخ کاربر به سوال «کل فایل یا بازه؟»: uid → Event (و متن پاسخ)
 range_replies: dict[int, threading.Event] = {}
 range_values: dict[int, str] = {}
+# پاسخ کاربر به سوال «متن‌محور یا عکس‌محور؟»
+mode_values: dict[int, str] = {}
+range_needed: dict[int, bool] = {}
 
 
 def log(*args) -> None:
@@ -178,6 +183,7 @@ def _default_state() -> dict:
             "model": DEFAULT_MODEL,
             "src_lang": "auto",
             "dst_lang": "fa",
+            "imgq": "small",
             "allowed": list(ALLOWED_ENV),
         },
         "users": {},
@@ -318,7 +324,24 @@ def paused_kb(jobkey: str, done: int) -> dict:
     ]]}
 
 
-def ask_range_kb(jobkey: str) -> dict:
+MODE_CHOICES = [("auto", "🤖 خودکار"), ("text", "📝 متن‌محور"),
+                ("image", "🖼 عکس‌محور (کامیک/اسکن)")]
+MODE_LABELS = {"auto": "🤖 خودکار", "text": "📝 متن‌محور", "image": "🖼 عکس‌محور (OCR)"}
+
+
+def ask_kb(jobkey: str, with_range: bool) -> dict:
+    """کیبورد سوال شروع: بازهٔ صفحه (برای فایل بزرگ) + حالت فایل (متن/عکس)."""
+    rows = []
+    if with_range:
+        rows.append([
+            {"text": "📖 کل فایل", "callback_data": f"rng:all:{jobkey}"},
+            {"text": "✂️ از صفحه … تا صفحه …", "callback_data": f"rng:part:{jobkey}"},
+        ])
+    rows.append([{"text": t, "callback_data": f"mod:{v}:{jobkey}"} for v, t in MODE_CHOICES])
+    return {"inline_keyboard": rows}
+
+
+def range_only_kb(jobkey: str) -> dict:
     return {"inline_keyboard": [[
         {"text": "📖 کل فایل", "callback_data": f"rng:all:{jobkey}"},
         {"text": "✂️ از صفحه … تا صفحه …", "callback_data": f"rng:part:{jobkey}"},
@@ -342,19 +365,25 @@ def deliver_file(chat: int, path: Path, caption: str) -> bool:
 def merge_partials(old_partial: Path | None, new_part: Path, split_at: int,
                    out_path: Path) -> Path:
     """ادغام پیشرفت قبلی و بخش تازه: صفحات [۰, split_at) از فایل قبلی + بقیه از فایل تازه.
-    (split_at = ۰ یعنی کل خروجی همان فایل تازه است.)"""
+    (split_at = ۰ یعنی کل خروجی همان فایل تازه است.)
+
+    باگ قبلی: سند جدید بعد از خواندن page_count با with بسته می‌شد و insert_pdf
+    بعدی روی سندِ بسته ValueError می‌داد → چک‌پوینت دوم/تحویل کارِ ادامه‌یافته
+    همیشه کرش می‌کرد («ادامه کار نمی‌کند»)."""
     if not old_partial or split_at <= 0 or not Path(old_partial).exists():
         return Path(new_part)
-    with pymupdf.open(str(new_part)) as nd:
-        n = nd.page_count
-    if split_at >= n:  # همهٔ صفحات از قبل ترجمه‌شده‌اند؛ همان فایل قبلی کافی است
-        shutil.copyfile(old_partial, out_path)
-        return out_path
     fin = pymupdf.open()
     try:
-        with pymupdf.open(str(old_partial)) as od:
-            fin.insert_pdf(od, from_page=0, to_page=min(split_at, od.page_count) - 1)
-        fin.insert_pdf(nd, from_page=split_at, to_page=n - 1)
+        with pymupdf.open(str(new_part)) as nd:
+            n = nd.page_count
+            if split_at >= n:  # همهٔ صفحات از قبل ترجمه‌شده‌اند؛ همان فایل قبلی کافی است
+                fin.close()
+                shutil.copyfile(old_partial, out_path)
+                return out_path
+            with pymupdf.open(str(old_partial)) as od:
+                fin.insert_pdf(od, from_page=0,
+                               to_page=min(split_at, od.page_count) - 1)
+            fin.insert_pdf(nd, from_page=split_at, to_page=n - 1)
         fin.save(str(out_path), garbage=3, deflate=True)
     finally:
         fin.close()
@@ -382,7 +411,13 @@ def drop_job_record(jobkey: str) -> None:
 
 def save_checkpoint(jobkey: str, rec: dict, in_pdf: Path, partial: Path,
                     done_pages: int) -> str:
-    """چک‌پوینت (PDF ورودی + خروجی ناتمام + متادیتا) را آپلود و مرجعش را برمی‌گرداند."""
+    """چک‌پوینت (PDF ورودی + خروجی ناتمام) را در Release asset ذخیره می‌کند.
+
+    • in.pdf فقط اولین بار آپلود می‌شود (چک‌پوینت‌های بعدی فقط partial را عوض می‌کنند)
+    • آپلود استریمی است (فایل چندصد مگابایتی حافظه را نمی‌گیرد)
+    • همهٔ فیلدهای لازم برای ادامه (بازه/حالت/صاحب کار) در رکورد state نوشته
+      می‌شوند — قبلاً فقط در meta.json بودند و بعد از ادامه گم می‌شدند.
+    """
     d = cp_dir(jobkey)
     d.mkdir(parents=True, exist_ok=True)
     try:
@@ -390,27 +425,31 @@ def save_checkpoint(jobkey: str, rec: dict, in_pdf: Path, partial: Path,
             shutil.move(str(in_pdf), str(d / "in.pdf"))
         if partial.exists() and partial != d / "partial.pdf":
             shutil.move(str(partial), str(d / "partial.pdf"))
-        (d / "meta.json").write_text(json.dumps({
-            "jobkey": jobkey, "done_pages": done_pages, "ts": time.time(),
-            **{k: rec.get(k) for k in ("name", "pages_total", "range_s", "range_e",
-                                       "uid", "chat", "size")},
-        }, ensure_ascii=False), encoding="utf-8")
     except Exception as e:  # noqa: BLE001
         log(f"آماده‌سازی چک‌پوینت ناموفق بود: {e}")
         return ""
-    old_ref = rec.get("cp_ref") or ""
-    ref = ""
+    ref_in = rec.get("ref_in") or ""
+    ref_pp = ""
     if GH_TOKEN and GH_REPO:
-        ref = gh_store.upload_checkpoint(
-            GH_REPO, GH_TOKEN, RUN_ID, f"cp-{jobkey}",
-            {"in.pdf": d / "in.pdf", "partial.pdf": d / "partial.pdf",
-             "meta.json": d / "meta.json"},
-            branch=GH_BRANCH, workdir=TMP_DIR, log=log)
-    if old_ref and old_ref != ref:
-        gh_store.cleanup_checkpoint(GH_REPO, GH_TOKEN, old_ref)
+        try:
+            if not ref_in and (d / "in.pdf").exists():
+                ref_in = gh_store.upload_release_file(
+                    GH_REPO, GH_TOKEN, gh_store.anon_tag(jobkey, "in"),
+                    "in.pdf", d / "in.pdf", branch=GH_BRANCH, log=log)
+            if (d / "partial.pdf").exists():
+                ref_pp = gh_store.upload_release_file(
+                    GH_REPO, GH_TOKEN, gh_store.anon_tag(jobkey, "pp"),
+                    "partial.pdf", d / "partial.pdf", branch=GH_BRANCH, log=log)
+        except Exception as e:  # noqa: BLE001
+            log(f"آپلود چک‌پوینت ناموفق بود: {e}")
+    # فیلدهای ادامه — قبلاً اینها فقط در meta.json بودند و بازسازی کار از دست می‌رفت
     save_job_record(jobkey, status="paused", done_pages=done_pages,
-                    cp_ref=ref, cp_local=bool(ref) or (d / "in.pdf").exists())
-    return ref
+                    pages_total=rec.get("pages_total"),
+                    range_s=rec.get("range_s"), range_e=rec.get("range_e"),
+                    uid=rec.get("uid"), chat=rec.get("chat"), name=rec.get("name"),
+                    size=rec.get("size"), mode=rec.get("mode") or "auto",
+                    ref_in=ref_in, ref_pp=ref_pp, cp_local=True)
+    return ref_pp or ref_in
 
 
 def boot_resume() -> None:
@@ -423,29 +462,36 @@ def boot_resume() -> None:
     n_q = n_r = 0
     for key, rec in sorted(jobs.items(), key=lambda kv: (kv[1].get("ts") or 0)):
         st = rec.get("status")
-        if st not in ("queued", "paused", "failed_cycle", "resuming"):
+        if st not in ("queued", "paused", "failed_cycle", "resuming", "ask"):
             drop_job_record(key)
             continue
         if now - (rec.get("ts") or 0) > 14 * 86400:  # چک‌پوینت کهنه
             drop_job_record(key)
-            gh_store.cleanup_checkpoint(GH_REPO, GH_TOKEN, rec.get("cp_ref") or "")
+            for r in (rec.get("ref_in") or "", rec.get("ref_pp") or ""):
+                gh_store.cleanup_release(GH_REPO, GH_TOKEN, r)
             continue
-        if st == "queued":
+        if st in ("queued", "ask"):
             job = {k: v for k, v in rec.items()
                    if k in ("chat", "uid", "file_id", "mid", "size", "name",
-                            "uname", "asked")}
+                            "uname", "asked", "mode")}
             job["jobkey"] = key
             if rec.get("range_e"):
                 job["range"] = (int(rec.get("range_s") or 1), int(rec["range_e"]))
+            if st == "ask":
+                save_job_record(key, asked=False, status="queued")  # سوال دوباره پرسیده می‌شود
             job_q.put(job)
             n_q += 1
             continue
         # paused / failed_cycle → چک‌پوینت بیاور
         d = cp_dir(key)
         ok = (d / "in.pdf").exists() and (d / "partial.pdf").exists()
-        if not ok and rec.get("cp_ref") and GH_TOKEN and GH_REPO:
-            ok = gh_store.download_checkpoint(GH_REPO, GH_TOKEN, rec["cp_ref"], d,
-                                              log=log)
+        if not ok and GH_TOKEN and GH_REPO:
+            if rec.get("ref_in") and not (d / "in.pdf").exists():
+                ok = gh_store.download_release_file(GH_REPO, GH_TOKEN, rec["ref_in"], d,
+                                                    fname="in.pdf", log=log)
+            if ok and rec.get("ref_pp") and not (d / "partial.pdf").exists():
+                ok = gh_store.download_release_file(GH_REPO, GH_TOKEN, rec["ref_pp"], d,
+                                                    fname="partial.pdf", log=log)
         if not ok:
             log(f"چک‌پوینت «{rec.get('name')}» بازیابی نشد؛ به کاربر خبر می‌دهم.")
             drop_job_record(key)
@@ -483,7 +529,8 @@ def snapshot_queues_to_state() -> None:
                         uid=job.get("uid"), file_id=job.get("file_id"),
                         mid=job.get("mid"), size=job.get("size"),
                         name=job.get("name"), uname=job.get("uname"),
-                        range=job.get("range"), asked=job.get("asked"))
+                        range=job.get("range"), asked=job.get("asked"),
+                        mode=job.get("mode"))
         moved += 1
     if moved:
         log(f"{moved} کارِ صف‌نشده برای چرخهٔ بعد ذخیره شد.")
@@ -947,6 +994,10 @@ def stats_text() -> str:
         return "\n".join(lines)
 
 
+IMGQ_LABELS = {"small": "کم — کوچک‌ترین فایل", "balanced": "متعادل", "high": "بالا — بی‌تغییر"}
+IMGQ_ORDER = ["small", "balanced", "high"]
+
+
 def admin_menu() -> dict:
     with state_lock:
         c = dict(state["config"])
@@ -957,7 +1008,8 @@ def admin_menu() -> dict:
         [b("📊 آمار کاربران", "ad:stats")],
         [b(f"🧠 مدل: {c.get('model')}", "ad:model"),
          b(f"⚡ سرعت: {speed_label(c.get('speed'))}", "ad:speed")],
-        [b(f"🌐 زبان: {src} → {dst}", "ad:lang")],
+        [b(f"🌐 زبان: {src} → {dst}", "ad:lang"),
+         b(f"🖼 کیفیت خروجی: {IMGQ_LABELS.get(c.get('imgq', 'small'))}", "ad:imgq")],
         [b(f"📄 سقف صفحه: {c.get('page_limit')}", "ad:limit"),
          b(f"📢 کانال اجباری: {'✅ روشن' if c.get('force_join') else '❌ خاموش'}", "ad:toggle")],
         [b(f"🔗 کانال: {c.get('channel') or '— تنظیم نشده —'}", "ad:channel"),
@@ -1077,9 +1129,9 @@ def handle_callback(cb: dict) -> None:
         pass
     if not chat:
         return
-    # دکمه‌های کارِ ترجمه (توقف/دریافت/ادامه/بازه) مال کاربرِ صاحب کار است؛ بقیه فقط ادمین
+    # دکمه‌های کارِ ترجمه (توقف/دریافت/ادامه/بازه/حالت) مال کاربرِ صاحب کار است؛ بقیه فقط ادمین
     prefix, _, rest = data.partition(":")
-    if prefix in ("jb", "rng"):
+    if prefix in ("jb", "rng", "mod"):
         kind, _, jkey = rest.partition(":")
         try:
             aj = active_jobs.get(jkey) or {}
@@ -1098,6 +1150,26 @@ def handle_callback(cb: dict) -> None:
                     edit(chat, mid, "✂️ بازهٔ صفحه را بفرست (مثلاً: <code>۱۰-۵۰</code> یا <code>۱۰ تا ۵۰</code>)\n"
                                     "فقط شروع را بفرستی، تا پایان فایل ترجمه می‌شود.\n"
                                     "برای لغو بنویس: <code>لغو</code>")
+                return
+            if prefix == "mod":
+                ev = range_replies.get(int(uid))
+                if ev is None or ev.is_set() or kind not in MODE_LABELS:
+                    return
+                mode_values[int(uid)] = kind
+                if range_needed.get(int(uid)) and not range_values.get(int(uid)):
+                    # هنوز جواب بازه نیامده؛ فقط حالت ثبت و ردیفش حذف می‌شود
+                    try:
+                        edit(chat, mid, f"✅ حالت ترجمه: {MODE_LABELS[kind]}\n"
+                                        "حالا کل فایل یا بازهٔ صفحه را انتخاب کن:",
+                             reply_markup=range_only_kb(jkey))
+                    except TgError:
+                        pass
+                    return
+                ev.set()
+                try:
+                    edit(chat, mid, f"✅ حالت ترجمه: {MODE_LABELS[kind]}")
+                except TgError:
+                    pass
                 return
             # prefix == "jb"
             if kind == "pause":
@@ -1121,7 +1193,7 @@ def handle_callback(cb: dict) -> None:
                 if rec.get("status") != "paused":
                     return  # قبلاً صف شده یا تمام شده
                 d = cp_dir(jkey)
-                if not (d / "in.pdf").exists() and not rec.get("cp_ref"):
+                if not (d / "in.pdf").exists() and not rec.get("ref_in"):
                     try:
                         send(chat, "⚠️ چک‌پوینت در دسترس نیست؛ لطفاً فایل را دوباره بفرست.")
                     except TgError:
@@ -1151,6 +1223,13 @@ def handle_callback(cb: dict) -> None:
         with state_lock:
             idx = SPEED_ORDER.index(state["config"]["speed"]) if state["config"]["speed"] in SPEED_ORDER else 0
             state["config"]["speed"] = SPEED_ORDER[(idx + 1) % len(SPEED_ORDER)]
+        dirty.set()
+        edit(chat, mid, "پنل ادمین ⚙️", reply_markup=admin_menu())
+    elif data == "ad:imgq":
+        with state_lock:
+            cur = state["config"].get("imgq", "small")
+            state["config"]["imgq"] = IMGQ_ORDER[(IMGQ_ORDER.index(cur) + 1) % len(IMGQ_ORDER)] \
+                if cur in IMGQ_ORDER else "small"
         dirty.set()
         edit(chat, mid, "پنل ادمین ⚙️", reply_markup=admin_menu())
     elif data == "ad:model":
@@ -1289,6 +1368,8 @@ WELCOME = (
     "🤖 موتور: {engine} — مدل <code>{model}</code>\n"
     "🌐 زبان: {src} → {dst}\n"
     "📎 فایل‌های بزرگ تا ~۲ گیگابایت هم پذیرفته می‌شود\n\n"
+    "🖼 فایل‌های عکس‌محور (اسکن، اسکرین‌شات کتاب، کامیک) هم با <b>OCR</b> ترجمه می‌شوند — "
+    "بعد از ارسال فایل، حالتش را انتخاب کن\n"
     "✂️ فایل‌های بزرگ: می‌توانی «از صفحه … تا صفحه …» ترجمه بگیری\n"
     "⏸ حین ترجمه: دکمهٔ توقف موقت و دریافت بخش ترجمه‌شده\n"
     "🔁 فایل‌های خیلی بزرگ: اگر در یک چرخه (۶ ساعت) کامل نشوند، از همان‌جا در چرخهٔ بعد خودکار ادامه می‌گیرند"
@@ -1299,6 +1380,9 @@ HELP = (
     f"سقف صفحه: تا <b>{{limit}}</b> صفحه در هر فایل (برای کل فایل یا هر بازه).\n"
     "ترجمه وفادار به متن اصلی است و چیدمان (جای متن، عکس، جدول، اندازه، بولد، رنگ) "
     "حفظ و برای زبان مقصد راست‌چین/آینه‌ای می‌شود.\n\n"
+    "🖼 <b>فایل عکس‌محور (اسکن/اسکرین‌شات/کامیک):</b> بعد از ارسال، «عکس‌محور» را بزن؛ "
+    "متن با OCR از تصویر برداشته، ترجمه و روی همان جای تصویر نشسته می‌شود. "
+    "«خودکار» هم صفحات بی‌متن را خودش با OCR می‌گیرد.\n"
     "✂️ <b>ترجمهٔ بازه‌ای:</b> برای فایل‌های ۱۵ صفحه‌ای به بالا، اول پرسیده می‌شود؛ "
     "بازه را مثل <code>۱۰-۵۰</code> بفرست.\n"
     "⏸ <b>توقف موقت:</b> دکمهٔ زیر پیام پیشرفت — تا همان‌جا ذخیره می‌شود.\n"
@@ -1377,7 +1461,7 @@ def on_document(m: dict) -> None:
 
 
 def process_job(job: dict) -> None:
-    """یک کار ترجمه را کامل انجام می‌دهد: دانلود، پرسش بازه، ترجمه، تحویل/چک‌پوینت."""
+    """یک کار ترجمه را کامل انجام می‌دهد: دانلود، پرسش بازه/حالت، ترجمه، تحویل/چک‌پوینت."""
     jobkey = job.get("jobkey") or f"{job.get('uid')}_{int(time.time())}"
 
     # ── مسیر ادامه از چک‌پوینت ──
@@ -1386,8 +1470,13 @@ def process_job(job: dict) -> None:
         if not rec or rec.get("status") not in ("resuming", "paused", "failed_cycle", "queued"):
             return
         d = cp_dir(jobkey)
-        if not (d / "in.pdf").exists() and rec.get("cp_ref") and GH_TOKEN and GH_REPO:
-            gh_store.download_checkpoint(GH_REPO, GH_TOKEN, rec["cp_ref"], d, log=log)
+        if not (d / "in.pdf").exists() and rec.get("ref_in") and GH_TOKEN and GH_REPO:
+            gh_store.download_release_file(GH_REPO, GH_TOKEN, rec["ref_in"], d,
+                                           fname="in.pdf", log=log)
+        if (d / "in.pdf").exists() and not (d / "partial.pdf").exists() \
+                and rec.get("ref_pp") and GH_TOKEN and GH_REPO:
+            gh_store.download_release_file(GH_REPO, GH_TOKEN, rec["ref_pp"], d,
+                                           fname="partial.pdf", log=log)
         if not (d / "in.pdf").exists() or not (d / "partial.pdf").exists():
             log(f"چک‌پوینت {jobkey} ناقص است (in/partial).")
             drop_job_record(jobkey)
@@ -1398,7 +1487,8 @@ def process_job(job: dict) -> None:
                 pass
             return
         job = {"chat": rec.get("chat"), "uid": rec.get("uid"), "name": rec.get("name"),
-               "size": rec.get("size"), "uname": rec.get("uname"), "jobkey": jobkey}
+               "size": rec.get("size"), "uname": rec.get("uname"), "jobkey": jobkey,
+               "mode": rec.get("mode") or "auto"}
         if rec.get("range_e"):
             job["range"] = (int(rec.get("range_s") or 1), int(rec["range_e"]))
         return _process_file(job, resume_rec=rec)
@@ -1482,28 +1572,44 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
         with state_lock:
             page_limit = int(state["config"].get("page_limit", 40))
 
-        # ── پرسش «کل فایل یا بازه؟» — فقط برای کار تازهٔ به‌اندازهٔ کافی بزرگ
-        if not resume_rec and range_ is None and not job.get("asked") \
-                and n_pages >= RANGE_ASK_MIN and not draining.is_set():
+        # ── پرسش «کل فایل یا بازه؟» و «متن‌محور یا عکس‌محور؟» — فقط برای کار تازه
+        mode = (job.get("mode") or "auto").strip() or "auto"
+        if not resume_rec and range_ is None and not job.get("asked") and not draining.is_set():
+            need_range = n_pages >= RANGE_ASK_MIN
             save_job_record(jobkey, status="ask", chat=chat, uid=uid, name=name,
                             file_id=job.get("file_id"), mid=mid, size=fsize,
-                            pages_total=n_pages)
-            send(chat, f"📚 فایل «{html_mod.escape(name)}» — <b>{n_pages:,}</b> صفحه.\n"
-                       "چطور ترجمه کنم؟", reply_markup=ask_range_kb(jobkey))
+                            pages_total=n_pages, mode=mode)
+            if need_range:
+                send(chat, f"📚 فایل «{html_mod.escape(name)}» — <b>{n_pages:,}</b> صفحه.\n"
+                           "چطور ترجمه کنم؟\n\n"
+                           "🖼 <b>حالت فایل:</b> متن‌محور (متن قابل انتخاب) یا عکس‌محور "
+                           "(اسکن/اسکرین‌شات/کامیک)؟ مطمئن نیستی؟ «خودکار» را بزن.",
+                     reply_markup=ask_kb(jobkey, True))
+            else:
+                send(chat, f"🖼 فایل «{html_mod.escape(name)}» <b>متن‌محور</b> است یا "
+                           "<b>عکس‌محور</b> (اسکن/اسکرین‌شات کتاب/کامیک)؟\n"
+                           "در حالت عکس‌محور، متن با OCR از تصویر برداشته می‌شود. "
+                           "مطمئن نیستی؟ «خودکار» را بزن.",
+                     reply_markup=ask_kb(jobkey, False))
             ev = threading.Event()
             range_replies[uid] = ev
-            deadline = time.time() + RANGE_WAIT_SEC
+            range_needed[uid] = need_range
+            mode_values.pop(uid, None)
+            deadline = time.time() + (RANGE_WAIT_SEC if need_range else MODE_WAIT_SEC)
             while not ev.is_set() and time.time() < deadline:
                 if job_pause.is_set() or stop_event.is_set() or draining.is_set():
                     break
                 ev.wait(2.0)
             val = (range_values.pop(uid, "") or "").strip()
+            mode = (mode_values.pop(uid, "") or "auto").strip() or "auto"
             range_replies.pop(uid, None)
-            save_job_record(jobkey, asked=True)
+            range_needed.pop(uid, None)
+            save_job_record(jobkey, asked=True, mode=mode)
             if job_pause.is_set() or draining.is_set() or stop_event.is_set():
                 save_job_record(jobkey, status="queued", chat=chat, uid=uid,
                                 file_id=job.get("file_id"), mid=mid, size=fsize,
-                                name=name, uname=job.get("uname"), asked=False)
+                                name=name, uname=job.get("uname"), asked=False,
+                                mode=mode)
                 in_pdf.unlink(missing_ok=True)
                 upd("⏳ چرخهٔ سرویس در حال تعویض است؛ فایل برای چرخهٔ بعدی نگه داشته شد و "
                     "کارش خودکار ادامه پیدا می‌کند — نیازی به فرستادن دوباره نیست.", force=True)
@@ -1522,7 +1628,8 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
             # چرخه در حال بسته‌شدن است؛ کار برای چرخهٔ بعد ذخیره می‌شود
             save_job_record(jobkey, status="queued", chat=chat, uid=uid,
                             file_id=job.get("file_id"), mid=mid, size=fsize,
-                            name=name, uname=job.get("uname"), asked=False)
+                            name=name, uname=job.get("uname"), asked=False,
+                            mode=mode)
             in_pdf.unlink(missing_ok=True)
             upd("⏳ چرخه در حال بسته‌شدن است؛ فایل برای چرخهٔ بعدی صف شد (خودکار ادامه می‌گیرد).",
                 force=True)
@@ -1578,9 +1685,11 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
             speed = state["config"].get("speed", "balanced")
             src_lang = state["config"].get("src_lang", "auto")
             dst_lang = state["config"].get("dst_lang", "fa")
+            imgq = state["config"].get("imgq", "small")
         w, sp = SPEEDS_OC.get(speed, SPEEDS_OC["balanced"])
         eng = engine()
         t0 = time.time()
+        mode_note = " | 🖼 عکس‌محور (OCR)" if mode == "image" else ""
 
         def progress(rel_done: int, rel_total: int) -> None:
             done_abs = done_old + rel_done
@@ -1588,7 +1697,7 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
             pct = rel_done * 100 // max(rel_total, 1)
             bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
             rng_note = f" (بازهٔ {rs:,}–{re_:,})" if range_ else ""
-            upd(f"🔄 ترجمه: {bar} {done_abs:,}/{re_:,} صفحه ({pct}٪){rng_note}",
+            upd(f"🔄 ترجمه: {bar} {done_abs:,}/{re_:,} صفحه ({pct}٪){rng_note}{mode_note}",
                 kb=job_progress_kb(jobkey))
 
         def extract_progress(rel_done: int, rel_total: int) -> None:
@@ -1601,7 +1710,8 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
                 force=True, kb=job_progress_kb(jobkey))
         else:
             upd(f"🌍 شروع ترجمهٔ <b>{range_n:,}</b> صفحه با <code>{eng['model']}</code> "
-                f"({LANG_LABEL.get(src_lang, src_lang)} → {LANG_LABEL.get(dst_lang, dst_lang)})…",
+                f"({LANG_LABEL.get(src_lang, src_lang)} → {LANG_LABEL.get(dst_lang, dst_lang)})"
+                f"{mode_note}…",
                 force=True, kb=job_progress_kb(jobkey))
         aj["part_pdf"] = str(out_pdf.with_suffix(".part.pdf"))  # برای دکمهٔ «دریافت تا اینجا»
 
@@ -1623,7 +1733,9 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
                 start_page=done_old if resume_rec else (rs - 1), end_page=re_,
                 log=lambda *a: None, mirror=True,
                 src_lang=src_lang, dst_lang=dst_lang, use_cli=True,
-                oc_bin=OC_BIN, oc_cwd=str(TMP_DIR))
+                oc_bin=OC_BIN, oc_cwd=str(TMP_DIR),
+                page_mode=mode, ocr_langs=core.tess_lang_for(src_lang),
+                img_quality=imgq)
         except core.FatalTranslationError as err:
             alert_admin_provider_down("OpenCode Zen", err)
             upd("❌ ترجمه انجام نشد: " + short_err(err) + "\nبه ادمین خبر بده.", force=True)
@@ -1668,7 +1780,8 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
                                   {"name": name, "pages_total": n_pages, "size": fsize,
                                    "uid": uid, "chat": chat, "range_s": rs if range_ else None,
                                    "range_e": re_ if range_ else None,
-                                   "cp_ref": (resume_rec or {}).get("cp_ref") or ""},
+                                   "mode": mode,
+                                   "ref_in": (resume_rec or {}).get("ref_in") or ""},
                                   in_pdf, merged, done_abs)
             out_mb = 0.0
             pp = cp_dir(jobkey) / "partial.pdf"
@@ -1710,6 +1823,9 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
             warn += f"\n⚠️ {failed_n} صفحه به‌خاطر خطای سرویس ترجمه نشد (متن اصلی ماند)."
         if skipped_n:
             warn += f"\n⚠️ {skipped_n} صفحه متن قابل استخراج نداشت (بدون تغییر کپی شد)."
+        ocr_n = int((res or {}).get("ocr_pages", 0) or 0)
+        if ocr_n:
+            warn += f"\n🖼 {ocr_n} صفحه با OCR ترجمه شد (متن از تصویر برداشته شد)."
         cap += warn
 
         upd("📤 در حال ارسال فایل ترجمه‌شده…", force=True)
@@ -1721,9 +1837,9 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
             return
 
         # پاکسازی چک‌پوینت و رکورد
-        old_ref = (resume_rec or {}).get("cp_ref") or ""
-        if old_ref:
-            gh_store.cleanup_checkpoint(GH_REPO, GH_TOKEN, old_ref)
+        for old_ref in ((resume_rec or {}).get("ref_in") or "",
+                        (resume_rec or {}).get("ref_pp") or ""):
+            gh_store.cleanup_release(GH_REPO, GH_TOKEN, old_ref)
         shutil.rmtree(cp_dir(jobkey), ignore_errors=True)
         drop_job_record(jobkey)
 
@@ -1780,7 +1896,7 @@ def worker() -> None:
                                 name=job.get("name"), uname=job.get("uname"),
                                 range_s=(job.get("range") or (None, None))[0],
                                 range_e=(job.get("range") or (None, None))[1],
-                                asked=job.get("asked"))
+                                asked=job.get("asked"), mode=job.get("mode"))
             job_q.task_done()
             continue
         job_pause.clear()   # توقفِ کار قبلی نباید به این کار سرایت کند

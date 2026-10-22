@@ -43,6 +43,15 @@ jobs:
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           "$HOME/.opencode/bin/opencode" --version
 
+      - name: نصب Tesseract OCR (برای فایل‌های عکس‌محور/کامیک)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-fas tesseract-ocr-ara \
+            tesseract-ocr-fra tesseract-ocr-deu tesseract-ocr-tur tesseract-ocr-rus \
+            tesseract-ocr-spa tesseract-ocr-ita tesseract-ocr-por tesseract-ocr-chi-sim \
+            tesseract-ocr-hin tesseract-ocr-urd >/dev/null
+          tesseract --version | head -1
+
       - name: 🛡 جلوگیری از اجرای موازی
         id: guard
         env:
@@ -78,7 +87,7 @@ jobs:
           RUN_MAX_MINUTES: "285"
           JOB_HARD_MINUTES: "345"
           MAX_PAGE_LIMIT: "2000"
-          SEC_PER_PAGE_EST: "4"
+          SEC_PER_PAGE_EST: "2.5"
           DRAIN_GRACE_MINUTES: "45"
           RANGE_ASK_MIN: "15"
           RANGE_WAIT_SEC: "480"
