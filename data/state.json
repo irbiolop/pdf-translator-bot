@@ -7,6 +7,7 @@
   "model": "deepseek-v4.1-flash-free",
   "src_lang": "auto",
   "dst_lang": "fa",
+  "imgq": "small",
   "allowed": [
    8748914497
   ],
@@ -42,36 +43,5 @@
   "pages": 479,
   "tokens": 1235384
  },
- "jobs": {
-  "7433357700_1792597601": {
-   "status": "resuming",
-   "chat": 7433357700,
-   "uid": 7433357700,
-   "name": "Robbins_&_Kumar_Basic_Pathology_11th_Edition.pdf",
-   "file_id": "BQACAgQAAxkBAANvatd0lZULjYVNS03vl39Nfd6pLI4AAr8gAAJiXjFSc53oik1VlIQ9BA",
-   "mid": 188,
-   "size": 167388515,
-   "pages_total": 936,
-   "ts": 1792623568.0160172,
-   "asked": true,
-   "done_pages": 543,
-   "cp_ref": "release:cp-7433357700_1792597601:663767717",
-   "cp_local": true
-  },
-  "7433357700_1792668846": {
-   "status": "paused",
-   "chat": 7433357700,
-   "uid": 7433357700,
-   "name": "Robbins_&_Kumar_Basic_Pathology_11th_Edition.pdf",
-   "file_id": "BQACAgQAAxkBAANvatd0lZULjYVNS03vl39Nfd6pLI4AAr8gAAJiXjFSc53oik1VlIQ9BA",
-   "mid": 200,
-   "size": 167388515,
-   "pages_total": 936,
-   "ts": 1792669277.300759,
-   "asked": true,
-   "done_pages": 0,
-   "cp_ref": "release:cp-7433357700_1792668846:665685589",
-   "cp_local": true
-  }
- }
+ "jobs": {}
 }
