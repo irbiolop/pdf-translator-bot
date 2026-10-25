@@ -16,8 +16,8 @@
  "users": {
   "7433357700": {
    "first": "2026-10-05",
-   "last": "2026-10-25 12:38",
-   "last_ts": 1792931934.3960373,
+   "last": "2026-10-25 12:41",
+   "last_ts": 1792932086.3475173,
    "pages": 479,
    "files": 7,
    "tokens": 1235384
@@ -74,6 +74,18 @@
    "mode": "auto",
    "ts": 1792801599.4896193,
    "asked": false
+  },
+  "7433357700_1792931934": {
+   "status": "ask",
+   "chat": 7433357700,
+   "uid": 7433357700,
+   "name": "Robbins_&_Kumar_Basic_Pathology_11th_Edition.pdf",
+   "file_id": "BQACAgQAAxkBAAP6at34Xh0-BxqfZnHthC9lciquDc0AAr8gAAJiXjFSc53oik1VlIQ9BA",
+   "mid": 250,
+   "size": 167388515,
+   "pages_total": 936,
+   "mode": "auto",
+   "ts": 1792932086.7739189
   }
  }
 }
