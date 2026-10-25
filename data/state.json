@@ -76,7 +76,7 @@
    "asked": false
   },
   "7433357700_1792931934": {
-   "status": "ask",
+   "status": "queued",
    "chat": 7433357700,
    "uid": 7433357700,
    "name": "Robbins_&_Kumar_Basic_Pathology_11th_Edition.pdf",
@@ -85,8 +85,8 @@
    "size": 167388515,
    "pages_total": 936,
    "mode": "auto",
-   "ts": 1792932567.2915816,
-   "asked": true
+   "ts": 1792943209.8297675,
+   "asked": false
   }
  }
 }
