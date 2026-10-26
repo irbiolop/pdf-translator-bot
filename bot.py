@@ -1128,16 +1128,27 @@ class MTProtoClient:
     def _call(self, coro_fn, timeout: float = 1800.0):
         if not (self.ready.is_set() and self._client and self._loop):
             return None
+        import concurrent.futures
         try:
             fut = asyncio.run_coroutine_threadsafe(coro_fn(), self._loop)
             return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            # کوروتین معلق باید واقعاً کنسل شود وگرنه حلقهٔ MTProto برای همیشه گیر می‌کند
+            try:
+                fut.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            self.last_error = f"تایم‌اوت {int(timeout)} ثانیه‌ای MTProto"
+            log(f"MTProto: {self.last_error}")
+            return None
         except Exception as e:  # noqa: BLE001
             log(f"MTProto call ناموفق بود: {type(e).__name__}: {e}")
             self.last_error = f"{type(e).__name__}: {e}"
             return None
 
     async def _fetch_msg(self, peer, message_id: int):
-        msg = await self._client.get_messages(peer, ids=[message_id])
+        import asyncio as _aio
+        msg = await _aio.wait_for(self._client.get_messages(peer, ids=[message_id]), timeout=90.0)
         m = msg[0] if isinstance(msg, list) else msg
         if not m or not getattr(m, "document", None):
             return None
@@ -1147,6 +1158,45 @@ class MTProtoClient:
         except Exception:  # noqa: BLE001
             pass
         return m
+
+    async def _dl_stream(self, m, dest: Path) -> bool:
+        """دانلود تکه‌به‌تکه با ساعت‌چی ضد گیر: هر تکه باید ظرف ۱۲۰ ثانیه برسد.
+
+        علت باگ «دانلود گیر می‌کند»: download_media بدون هیچ سقفی روی پاسخ تکه‌ها
+        منتظر می‌ماند و انتقال متوقف‌شده تا ۳۰ دقیقه (تایم‌اوت مسیر) بلوک می‌کرد."""
+        import asyncio as _aio
+        dest = Path(dest)
+        tmp = dest.with_suffix(".part_dl")
+        got = 0
+        last_log = time.time()
+        try:
+            with open(tmp, "wb") as f:
+                it = self._client.iter_download(m, request_size=512 * 1024,
+                                                chunk_size=512 * 1024)
+                while True:
+                    try:
+                        chunk = await _aio.wait_for(it.__anext__(), timeout=120.0)
+                    except StopAsyncIteration:
+                        break
+                    except _aio.TimeoutError:
+                        raise RuntimeError(
+                            f"دانلود متوقف شد — تکه‌ای ظرف ۱۲۰ ثانیه نرسید ({got / 1048576:.0f}MB گرفته شده)")
+                    if chunk:
+                        f.write(chunk)
+                        got += len(chunk)
+                        if time.time() - last_log > 30:
+                            last_log = time.time()
+                            log(f"دانلود MTProto: {got / 1048576:.0f}MB…")
+            if got <= 0:
+                raise RuntimeError("هیچ داده‌ای دانلود نشد")
+            tmp.replace(dest)
+            return True
+        finally:
+            try:
+                if not dest.exists() and tmp.exists():
+                    tmp.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
 
     def download(self, chat_id: int, message_id: int, dest: Path) -> bool:
         """دانلود مدیای یک پیام با MTProto (بدون سقف ۲۰MB Bot API)."""
@@ -1158,29 +1208,38 @@ class MTProtoClient:
             return False
 
         async def _dl_cached(m) -> bool:
-            out = await self._client.download_media(m, file=str(dest))
-            p = Path(str(out)) if out else dest
-            return p.exists() and p.stat().st_size > 0
+            return await self._dl_stream(m, dest)
 
         # ۱) پیام زندهٔ کش‌شده (کاملاً بدون رزولوشن)
         m = self._take_media(chat_id, message_id, timeout=20.0)
-        if m is not None and self._call(lambda: _dl_cached(m)):
+        if m is not None and self._call(lambda: _dl_cached(m), timeout=1500.0):
             return True
+
+        def _clean_partial():
+            try:
+                Path(str(dest)).with_suffix(".part_dl").unlink(missing_ok=True)
+                Path(str(dest)).unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
 
         # ۲) InputPeerUser با hash صفر — برای گفتگوی خصوصی کاربر با ربات
         try:
             from telethon.tl.types import InputPeerUser
             r = self._call(lambda: self._dl_by_peer(InputPeerUser(chat_id, 0),
-                                                    message_id, dest))
+                                                    message_id, dest),
+                           timeout=1500.0)
             if r:
                 return True
+            _clean_partial()
         except Exception as e:  # noqa: BLE001
             log(f"مسیر hash=0 ناموفق: {e}")
             self.last_error = self.last_error or str(e)
+            _clean_partial()
 
         # ۳) رزولوشن با کش entity Telethon
-        if self._call(lambda: self._dl_by_peer(chat_id, message_id, dest)):
+        if self._call(lambda: self._dl_by_peer(chat_id, message_id, dest), timeout=1500.0):
             return True
+        _clean_partial()
 
         log(f"دانلود MTProto کامل شکست خورد ({chat_id}/{message_id}): "
             f"{self.last_error or 'پیام پیدا نشد'}")
@@ -1198,9 +1257,7 @@ class MTProtoClient:
         if m is None:
             self.last_error = self.last_error or "پیام با این آیدی پیدا نشد"
             return False
-        out = await self._client.download_media(m, file=str(dest))
-        p = Path(str(out)) if out else dest
-        return p.exists() and p.stat().st_size > 0
+        return await self._dl_stream(m, dest)
 
     def upload(self, chat_id: int, path: Path, caption: str) -> bool:
         """ارسال فایل خروجی بزرگ با MTProto (بدون سقف ۵۰MB Bot API)."""
@@ -2025,7 +2082,16 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
                         raise RuntimeError("پشتیبانی MTProto برای فایل‌های بزرگ هنوز آماده نیست.")
                     upd(f"⬇️ فایل بزرگ ({fsize / (1024 * 1024):.0f} مگابایت) — دانلود با MTProto…",
                         force=True)
-                    if not MT.download(chat, int(mid or 0), in_pdf):
+                    ok_dl = False
+                    for att in range(2):
+                        if MT.download(chat, int(mid or 0), in_pdf):
+                            ok_dl = True
+                            break
+                        if att == 0:
+                            upd("🔁 دانلود ناتمام ماند؛ ۲۰ ثانیه دیگر دوباره امتحان می‌کنم…",
+                                force=True)
+                            time.sleep(20.0)
+                    if not ok_dl:
                         raise RuntimeError("دانلود MTProto ناموفق بود.")
                 else:
                     f = api("getFile", file_id=job["file_id"], timeout=30)
