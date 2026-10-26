@@ -145,6 +145,10 @@ MODE_WAIT_SEC = int(os.environ.get("MODE_WAIT_SEC", "45") or 45)
 RUN_ID = int(os.environ.get("GITHUB_RUN_ID", "0") or 0)   # برای آپلود artifact چک‌پوینت
 CP_DIR = Path("data/cp")
 MIN_CYCLE_LEFT_MIN = 10.0  # اگر کمتر از این تا پایان چرخه مانده، کار تازه صفِ چرخهٔ بعد می‌شود
+# فصل‌به‌فصل: فایل‌های بزرگ‌تر از این تعداد صفحه، فصل‌به‌فصل ترجمه و گزارش می‌شوند
+CHAPTER_MIN_PAGES = int(os.environ.get("CHAPTER_MIN_PAGES", "60") or 60)
+# مقصد کپی خروجی برای کارهای ادمین (کاربر بار دیگری درخواست کرده)
+DELIVERY_EXTRA = os.environ.get("DELIVERY_EXTRA", "@PrivateUssser").strip()
 
 state_lock = threading.RLock()
 dirty = threading.Event()
@@ -398,6 +402,354 @@ def save_job_record(jobkey: str, **fields) -> None:
     dirty.set()
 
 
+# --------------------------------------------------------------------------
+# ترجمهٔ فصل‌به‌فصل — فایل‌های بزرگ (کتاب) فصل‌به‌فصل ترجمه، چک‌پوینت و گزارش می‌شوند
+# --------------------------------------------------------------------------
+
+def book_chapters(pdf_path: Path, rs: int = 1, re_: int | None = None,
+                  min_pages: int = 3, max_chunks: int = 45) -> list[dict]:
+    """فصل‌های کتاب از فهرست (TOC) PDF برای بازهٔ ۱مبنا [rs, re_].
+
+    خروجی: [{"t": عنوان, "s": شروع, "e": پایان}] (۱مبنا، شامل). اگر فهرست معتبر
+    نبود یا فصل‌ها به بازه نخورد، تکه‌های هم‌اندازهٔ «بخش» ساخته می‌شود تا همیشه
+    پوشش کامل [rs, re_] با گزارش مرحله‌ای داشته باشیم."""
+    try:
+        with pymupdf.open(str(pdf_path)) as d:
+            n = d.page_count
+            toc = d.get_toc(simple=True)
+    except Exception:  # noqa: BLE001
+        n, toc = 0, []
+    if not n or rs > n:
+        return []
+    rs = max(1, rs)
+    re_ = min(n, re_ or n)
+    if re_ < rs:
+        return []
+    pts: list[tuple[str, int]] = []
+    for lvl, t, p in (toc or []):
+        if lvl != 1 or not p:
+            continue
+        p = max(1, min(int(p), n))
+        if pts and p <= pts[-1][1]:
+            continue
+        title = re.sub(r"\s+", " ", (t or "").strip())[:60] or "فصل"
+        pts.append((title, p))
+    cuts = [p for _, p in pts if rs < p <= re_]
+    segs: list[tuple[int, int]] = []
+    prev = rs
+    for p in cuts:
+        if p - 1 >= prev:
+            segs.append((prev, p - 1))
+        prev = p
+    if prev <= re_:
+        segs.append((prev, re_))
+    tmap = {p: t for t, p in pts}
+    chs = []
+    for i, (s, e) in enumerate(segs):
+        t = tmap.get(s) or ("صفحات آغازین" if i == 0 else f"بخش {i + 1}")
+        chs.append({"t": t, "s": s, "e": e})
+    # ادغام فصل‌های خیلی کوچک با قبلی
+    merged: list[dict] = []
+    for c in chs:
+        if merged and (c["e"] - c["s"] + 1) < min_pages:
+            merged[-1]["e"] = c["e"]
+        else:
+            merged.append(c)
+    # سقف تعداد فصل
+    while len(merged) > max_chunks:
+        try:
+            idx = min(range(1, len(merged)), key=lambda i: merged[i]["e"] - merged[i]["s"])
+        except ValueError:
+            break
+        merged[idx - 1]["e"] = merged[idx]["e"]
+        merged.pop(idx)
+    return merged
+
+
+def extract_pages(src: Path, s0: int, e0: int, out: Path) -> Path:
+    """صفحات [s0, e0] صفرمبنا از سند کامل را به یک PDF کوچک مستقل برش می‌زند."""
+    d = pymupdf.open()
+    try:
+        with pymupdf.open(str(src)) as s:
+            d.insert_pdf(s, from_page=s0, to_page=e0)
+        d.save(str(out), garbage=3, deflate=True)
+    finally:
+        d.close()
+    return out
+
+
+def build_master(in_pdf: Path, chapters: list[dict], done_k: int, ch_dir: Path,
+                 out_path: Path, img_quality: str = "small",
+                 finalize: bool = True, log=log) -> Path:
+    """مونتاژ نسخهٔ کامل/میانی: صفحات فصل‌های کامل‌شده از فایل فصل‌ها، بقیه از اصل.
+
+    finalize=True فقط برای تحویل نهایی: زیرمجموعه‌سازی فونت + بازفشرده‌سازی
+    تصاویر یک‌بار روی کل سند (در ترجمهٔ فصل‌به‌فصل این کار عمداً به تعویق افتاده)."""
+    fin = pymupdf.open(str(in_pdf))
+    try:
+        for k in range(min(done_k, len(chapters))):
+            ch = chapters[k]
+            f = ch_dir / f"ch_{k:03d}.pdf"
+            if not f.exists():
+                log(f"فایل فصل {k + 1} پیدا نشد؛ آن صفحات از نسخهٔ اصلی می‌ماند.")
+                continue
+            s0, e0 = ch["s"] - 1, ch["e"] - 1
+            try:
+                fin.delete_pages(list(range(s0, e0 + 1)))
+                with pymupdf.open(str(f)) as nd:
+                    fin.insert_pdf(nd, start_at=s0)
+            except Exception as e:  # noqa: BLE001
+                log(f"ادغام فصل {k + 1} ناموفق بود: {e}")
+        if finalize:
+            try:
+                core._finalize_save(fin, str(out_path), log, img_quality)
+            except Exception as e:  # noqa: BLE001
+                log(f"ذخیرهٔ نهایی مونتاژ ناموفق بود ({e})؛ ذخیرهٔ ساده…")
+                fin.save(str(out_path), garbage=3, deflate=True)
+        else:
+            fin.save(str(out_path), garbage=3, deflate=True)
+    finally:
+        fin.close()
+    return out_path
+
+
+def upload_chapter_checkpoint(jobkey: str, in_pdf: Path, ch_pdf: Path, k: int,
+                              ref_in: str) -> str:
+    """چک‌پوینت فصل: in.pdf فقط بار اول آپلود می‌شود؛ فایل فصل k در تگ خودش.
+
+    خروجی: ref_in (شاید جدید). شکست آپلود مرگبار نیست — فصل در چرخهٔ بعد دوباره
+    ترجمه می‌شود."""
+    d = cp_dir(jobkey)
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        if not (d / "in.pdf").exists() and in_pdf.exists():
+            shutil.copyfile(in_pdf, d / "in.pdf")
+        if (d / "in.pdf").exists() and GH_TOKEN and GH_REPO and not ref_in:
+            ref_in = gh_store.upload_release_file(
+                GH_REPO, GH_TOKEN, gh_store.anon_tag(jobkey, "in"),
+                "in.pdf", d / "in.pdf", branch=GH_BRANCH, log=log)
+    except Exception as e:  # noqa: BLE001
+        log(f"آپلود in.pdf چک‌پوینت ناموفق بود: {e}")
+    try:
+        if GH_TOKEN and GH_REPO and ch_pdf.exists():
+            gh_store.upload_release_file(
+                GH_REPO, GH_TOKEN, gh_store.anon_tag(jobkey, f"ch{k:03d}"),
+                "ch.pdf", ch_pdf, branch=GH_BRANCH, log=log)
+    except Exception as e:  # noqa: BLE001
+        log(f"آپلود چک‌پوینت فصل {k + 1} ناموفق بود: {e}")
+    return ref_in
+
+
+def extra_delivery_chat() -> int | None:
+    """چت مقصد کپی خروجی برای کارهای ادمین (یک‌بار resolve و کش می‌شود)."""
+    if not DELIVERY_EXTRA or not DELIVERY_EXTRA.startswith("@"):
+        return None
+    if "id" in extra_delivery_chat.cache:
+        return extra_delivery_chat.cache["id"]
+    cid = None
+    try:
+        c = api("getChat", chat_id=DELIVERY_EXTRA, timeout=20)
+        cid = int(c.get("id") or 0) or None
+    except TgError:
+        cid = None
+    except Exception:  # noqa: BLE001
+        cid = None
+    extra_delivery_chat.cache["id"] = cid
+    return cid
+
+
+extra_delivery_chat.cache = {}
+
+
+def _translate_by_chapters(ctx: dict) -> dict:
+    """حلقهٔ فصل‌به‌فصل: هر فصل جدا ترجمه، جدا چک‌پوینت و جدا به کاربر گزارش می‌شود.
+
+    ctx: jobkey, chat, uid, aj, upd, in_pdf, rs, re_, chapters, start_k,
+         w, sp, eng, mode, src_lang, dst_lang, imgq, name, n_pages
+    خروجی: {"status": "done"|"paused"|"failed", "res": {...}, "done_pages": int, ...}
+    """
+    jobkey = ctx["jobkey"]
+    chat, uid = ctx["chat"], ctx["uid"]
+    aj, upd = ctx["aj"], ctx["upd"]
+    in_pdf = ctx["in_pdf"]
+    chapters = ctx["chapters"]
+    n_ch = len(chapters)
+    done_k = int(ctx.get("start_k") or 0)
+    re_ = ctx["re_"]
+    eng, w, sp = ctx["eng"], ctx["w"], ctx["sp"]
+    mode = ctx["mode"]
+    src_lang, dst_lang = ctx["src_lang"], ctx["dst_lang"]
+    imgq = ctx["imgq"]
+    n_pages_total = int(ctx.get("n_pages") or 0)
+    ch_dir = cp_dir(jobkey)
+    ch_dir.mkdir(parents=True, exist_ok=True)
+    ref_in = ctx.get("ref_in") or ""
+    usage_tot: dict = {}
+    agg = {"failed": 0, "skipped": 0, "ocr": 0, "hl": 0}
+    ch_refs = list(ctx.get("ch_refs") or [])
+    t_loop = time.time()
+
+    def _rec_update(k_done: int) -> None:
+        done_pages = chapters[k_done - 1]["e"] if k_done > 0 else 0
+        save_job_record(jobkey, status="paused", chapters=json.dumps(chapters, ensure_ascii=False),
+                        chapters_done=k_done, ch_refs=list(ch_refs), done_pages=done_pages,
+                        ref_in=ref_in, pages_total=n_pages_total, cp_local=True)
+        try:
+            commit_state("chapter-checkpoint")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ensure_in_uploaded() -> None:
+        """اگر هنوز فایل اصلی چک‌پوینت نشده (توقف قبل از اولین فصل)، آپلودش کن تا
+        چرخهٔ بعد بتواند از صفرِ همین فایل ادامه دهد — کاربر فایل را دوباره نفرستد."""
+        nonlocal ref_in
+        if ref_in or not (GH_TOKEN and GH_REPO) or not in_pdf.exists():
+            return
+        try:
+            d = cp_dir(jobkey)
+            d.mkdir(parents=True, exist_ok=True)
+            if not (d / "in.pdf").exists():
+                shutil.copyfile(in_pdf, d / "in.pdf")
+            ref_in = gh_store.upload_release_file(
+                GH_REPO, GH_TOKEN, gh_store.anon_tag(jobkey, "in"),
+                "in.pdf", d / "in.pdf", branch=GH_BRANCH, log=log)
+        except Exception as e:  # noqa: BLE001
+            log(f"آپلود in.pdf در توقف زودهنگام ناموفق بود: {e}")
+
+    for k in range(done_k, n_ch):
+        ch = chapters[k]
+        ch_pages = ch["e"] - ch["s"] + 1
+        # ── گیت زمان قبل از شروع فصل ──
+        if RUN_MAX_MINUTES:
+            remaining_min = ((start_ts + JOB_HARD_MINUTES * 60) - time.time()) / 60.0
+            overhead = 3.0 if n_pages_total > 300 else 0.5
+            ch_min = overhead + ch_pages * SEC_PER_PAGE_EST / 60
+            if remaining_min < max(ch_min + 20, MIN_CYCLE_LEFT_MIN + 10):
+                _ensure_in_uploaded()
+                _rec_update(done_k)
+                upd(f"⏳ تا پایان این چرخه برای فصل بعدی («{html_mod.escape(ch['t'])}») وقت کافی نیست؛ "
+                    f"چرخهٔ تازه خودش از همین‌جا ادامه می‌دهد "
+                    f"({done_k}/{n_ch} فصل کامل شده).", force=True)
+                return {"status": "paused", "done_k": done_k, "agg": agg,
+                        "usage": usage_tot, "reason": "time"}
+        if draining.is_set() or stop_event.is_set():
+            _ensure_in_uploaded()
+            _rec_update(done_k)
+            upd(f"⏳ پایان چرخهٔ سرویس — {done_k}/{n_ch} فصل ذخیره شد؛ چرخهٔ بعد خودش ادامه می‌دهد.",
+                force=True)
+            return {"status": "paused", "done_k": done_k, "agg": agg,
+                    "usage": usage_tot, "reason": "drain"}
+
+        k1 = k + 1
+        title = ch["t"]
+        upd(f"📘 فصل {k1}/{n_ch}: «{html_mod.escape(title)}» — {ch_pages:,} صفحه…",
+            force=True, kb=job_progress_kb(jobkey))
+
+        def progress(d: int, t: int, _s0=ch["s"], _k1=k1, _n=n_ch) -> None:
+            done_abs = _s0 - 1 + d
+            aj["last_done"] = done_abs
+            pct = d * 100 // max(t, 1)
+            bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
+            upd(f"📘 فصل {_k1}/{_n}: {bar} {d:,}/{t:,} صفحه ({pct}٪)",
+                kb=job_progress_kb(jobkey))
+
+        def extract_progress(d: int, t: int, _k1=k1, _n=n_ch) -> None:
+            if d % 20 == 0 or d == t:
+                upd(f"📖 فصل {_k1}/{_n}: آماده‌سازی متن {d:,}/{t:,} صفحه…",
+                    kb=job_progress_kb(jobkey))
+
+        ch_out = TMP_DIR / f"{jobkey}_chrun_{k:03d}.pdf"
+        t_ch = time.time()
+        try:
+            res = core.translate_pdf(
+                str(in_pdf), str(ch_out), "", model=eng["model"],
+                base_url="", workers=w, spacing=sp,
+                progress=progress, cancelled=job_pause,
+                extract_progress=extract_progress,
+                start_page=ch["s"] - 1, end_page=ch["e"],
+                log=lambda *a: None, mirror=True,
+                src_lang=src_lang, dst_lang=dst_lang, use_cli=True,
+                oc_bin=OC_BIN, oc_cwd=str(TMP_DIR),
+                page_mode=mode, ocr_langs=core.tess_lang_for(src_lang),
+                img_quality=imgq, plain_save=True)
+        except core.FatalTranslationError as err:
+            _rec_update(done_k)
+            return {"status": "failed", "err": err, "done_k": done_k, "agg": agg,
+                    "usage": usage_tot, "kind": "fatal"}
+        except core.TranslationError as err:
+            _rec_update(done_k)
+            return {"status": "failed", "err": err, "done_k": done_k, "agg": agg,
+                    "usage": usage_tot, "kind": "trans"}
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            _rec_update(done_k)
+            return {"status": "failed", "err": e, "done_k": done_k, "agg": agg,
+                    "usage": usage_tot, "kind": "unexpected"}
+
+        if res.get("cancelled"):
+            ch_out.unlink(missing_ok=True)
+            _ensure_in_uploaded()
+            _rec_update(done_k)
+            upd(f"⏸ توقف موقت — تا فصل {done_k}/{n_ch} ذخیره شد؛ با دکمهٔ ادامه از همین‌جا ادامه می‌گیرد.",
+                force=True, kb=paused_kb(jobkey, chapters[done_k - 1]["e"] if done_k else 0))
+            return {"status": "paused", "done_k": done_k, "agg": agg,
+                    "usage": usage_tot, "reason": "cancel"}
+
+        # ── برش فایل کوچک فصل + چک‌پوینت ──
+        ch_pdf = ch_dir / f"ch_{k:03d}.pdf"
+        try:
+            extract_pages(ch_out, ch["s"] - 1, ch["e"] - 1, ch_pdf)
+        except Exception as e:  # noqa: BLE001
+            log(f"برش فصل {k1} ناموفق بود: {e}")
+            return {"status": "failed",
+                    "err": f"خطا در ذخیرهٔ فصل {k1}: {e}", "done_k": done_k,
+                    "agg": agg, "usage": usage_tot, "kind": "unexpected"}
+        ch_out.unlink(missing_ok=True)
+        ref_in = upload_chapter_checkpoint(jobkey, in_pdf, ch_pdf, k, ref_in)
+        done_k = k + 1
+        ch_refs.append(("rel:" + gh_store.anon_tag(jobkey, f"ch{k:03d}"))
+                       if GH_TOKEN and GH_REPO else f"local:ch{k:03d}")
+        _rec_update(done_k)
+
+        # ── گزارش فصل به کاربر (پیام جدا تا همه‌شان در چت بماند) ──
+        u = (res or {}).get("usage", {})
+        for kk, vv in u.items():
+            usage_tot[kk] = usage_tot.get(kk, 0) + int(vv or 0)
+        agg["failed"] += len((res or {}).get("failed_pages", []))
+        agg["skipped"] += len((res or {}).get("skipped_pages", []))
+        agg["ocr"] += int((res or {}).get("ocr_pages", 0) or 0)
+        agg["hl"] += int((res or {}).get("hl_applied", 0) or 0)
+        dt_ch = time.time() - t_ch
+        done_pages = ch["e"]
+        pct_all = done_pages * 100 // max(re_, 1)
+        hl_note = f" | 🖍 {int((res or {}).get('hl_applied', 0) or 0):,} هایلایت روی ترجمه نشست" \
+            if int((res or {}).get("hl_applied", 0) or 0) else ""
+        try:
+            send(chat, f"✅ فصل {k1}/{n_ch}: «{html_mod.escape(title)}» — "
+                       f"{ch_pages:,} صفحه در {dt_ch / 60:.1f} دقیقه{hl_note}\n"
+                       f"📊 پیشرفت کل: {done_pages:,}/{re_:,} صفحه ({pct_all}٪)")
+        except TgError:
+            pass
+        upd(f"📊 فصل {k1}/{n_ch} کامل شد — {done_pages:,}/{re_:,} صفحه ({pct_all}٪)",
+            force=True, kb=job_progress_kb(jobkey))
+
+    # ── همهٔ فصل‌ها کامل شد: مونتاژ نهایی ──
+    master = TMP_DIR / f"{jobkey}_master.pdf"
+    try:
+        build_master(in_pdf, chapters, done_k, ch_dir, master, imgq, finalize=True)
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        return {"status": "failed", "err": f"خطا در مونتاژ نهایی: {e}",
+                "done_k": done_k, "agg": agg, "usage": usage_tot, "kind": "unexpected"}
+    translated_pages = sum(c["e"] - c["s"] + 1 for c in chapters)
+    res = {"output": str(master), "usage": usage_tot,
+           "failed_pages": [], "skipped_pages": [],
+           "translated": translated_pages, "ocr_pages": agg["ocr"],
+           "hl_applied": agg["hl"]}
+    return {"status": "done", "res": res, "done_k": done_k, "done_pages": re_,
+            "usage": usage_tot, "secs": time.time() - t_loop, "ch_refs": list(ch_refs)}
+
+
 def get_job_record(jobkey: str) -> dict:
     with state_lock:
         return dict(state["jobs"].get(jobkey) or {})
@@ -460,6 +812,7 @@ def boot_resume() -> None:
         return
     now = time.time()
     n_q = n_r = 0
+    seen_files: set[tuple] = set()  # حذف تکراری‌ها: (uid, size) برای صف/سوال
     for key, rec in sorted(jobs.items(), key=lambda kv: (kv[1].get("ts") or 0)):
         st = rec.get("status")
         if st not in ("queued", "paused", "failed_cycle", "resuming", "ask"):
@@ -469,8 +822,16 @@ def boot_resume() -> None:
             drop_job_record(key)
             for r in (rec.get("ref_in") or "", rec.get("ref_pp") or ""):
                 gh_store.cleanup_release(GH_REPO, GH_TOKEN, r)
+            for r in (rec.get("ch_refs") or []):
+                gh_store.cleanup_release(GH_REPO, GH_TOKEN, r)
             continue
         if st in ("queued", "ask"):
+            sig = (rec.get("uid"), rec.get("size"))
+            if sig in seen_files:
+                # فایل تکراری (همان کاربر همان فایل چندبار فرستاده) — قدیمی حذف می‌شود
+                drop_job_record(key)
+                continue
+            seen_files.add(sig)
             job = {k: v for k, v in rec.items()
                    if k in ("chat", "uid", "file_id", "mid", "size", "name",
                             "uname", "asked", "mode")}
@@ -484,6 +845,41 @@ def boot_resume() -> None:
             continue
         # paused / failed_cycle → چک‌پوینت بیاور
         d = cp_dir(key)
+        if rec.get("chapters"):
+            # حالت فصل‌به‌فصل: in.pdf + هر فایل فصل کافی است (partial.pdf ندارد)
+            ok = True
+            if not (d / "in.pdf").exists():
+                ok = bool(rec.get("ref_in")) and bool(GH_TOKEN and GH_REPO) and \
+                    gh_store.download_release_file(GH_REPO, GH_TOKEN, rec["ref_in"], d,
+                                                   fname="in.pdf", log=log)
+            n_ok = 0
+            for i, ref in enumerate(rec.get("ch_refs") or []):
+                f = d / f"ch_{i:03d}.pdf"
+                if f.exists():
+                    n_ok += 1
+                elif ref and GH_TOKEN and GH_REPO and \
+                        gh_store.download_release_file(GH_REPO, GH_TOKEN, ref, d,
+                                                       fname="ch.pdf", log=log):
+                    try:
+                        (d / "ch.pdf").rename(f)
+                        n_ok += 1
+                    except Exception:  # noqa: BLE001
+                        pass
+            if not ok or not (d / "in.pdf").exists():
+                log(f"چک‌پوینت فصلی «{rec.get('name')}» بازیابی نشد؛ به کاربر خبر می‌دهم.")
+                drop_job_record(key)
+                try:
+                    send(rec.get("chat"), f"⚠️ ادامهٔ ترجمهٔ «{html_mod.escape(str(rec.get('name') or 'فایل'))}» "
+                                          "ممکن نشد (چک‌پوینت در دسترس نبود). لطفاً فایل را دوباره بفرست.")
+                except TgError:
+                    pass
+                continue
+            if n_ok < len(rec.get("ch_refs") or []):
+                # بعضی فصل‌ها نیامدند؛ همان تعداد موجود ادامه می‌گیرد (فصل‌های جامانده دوباره ترجمه می‌شوند)
+                save_job_record(key, ch_refs=(rec.get("ch_refs") or [])[:n_ok])
+            job_q.put({"resume": key})
+            n_r += 1
+            continue
         ok = (d / "in.pdf").exists() and (d / "partial.pdf").exists()
         if not ok and GH_TOKEN and GH_REPO:
             if rec.get("ref_in") and not (d / "in.pdf").exists():
@@ -1069,51 +1465,79 @@ def lang_menu() -> dict:
 def handle_send_partial(chat: int, jkey: str, aj: dict, rec: dict) -> None:
     """دکمهٔ «دریافت تا اینجا»: آخرین snapshot ذخیره‌شده را می‌فرستد (بدون توقف ترجمه)."""
     def _do() -> None:
-        cands = []
-        if aj.get("part_pdf") and Path(aj["part_pdf"]).exists():
-            cands.append(Path(aj["part_pdf"]))
-        d = cp_dir(jkey)
-        if (d / "partial.pdf").exists():
-            cands.append(d / "partial.pdf")
-        src = cands[0] if cands else None
-        if src is None:
+        try:
+            chapters = None
             try:
+                if rec.get("chapters"):
+                    chapters = json.loads(rec["chapters"])
+            except Exception:  # noqa: BLE001
+                chapters = None
+            if chapters:
+                # حالت فصل‌به‌فصل: مونتاژ از فایل‌های فصل (چون master مدام ذخیره نمی‌شود)
+                d = cp_dir(jkey)
+                done_k = sum(1 for i in range(len(chapters))
+                             if (d / f"ch_{i:03d}.pdf").exists())
+                if not done_k or not (d / "in.pdf").exists():
+                    send(chat, "⏳ هنوز فصلی کامل نشده؛ چند دقیقهٔ دیگر دوباره بزن.")
+                    return
+                snap = TMP_DIR / f"snap_{jkey}.pdf"
+                try:
+                    build_master(d / "in.pdf", chapters, done_k, d, snap,
+                                 finalize=False)
+                    done = chapters[done_k - 1]["e"]
+                    cap = (f"📥 بخش ترجمه‌شدهٔ «{html_mod.escape(str(aj.get('name') or rec.get('name') or 'فایل'))}» — "
+                           f"تا فصل {done_k}/{len(chapters)} (صفحهٔ {done:,})؛ بقیه در فایل متن اصلی است")
+                    if deliver_file(chat, snap, cap):
+                        try:
+                            send(chat, "ℹ️ این نسخهٔ میانی است؛ نسخهٔ کامل بعد از پایان ترجمه ارسال می‌شود.")
+                        except TgError:
+                            pass
+                    else:
+                        send(chat, "❌ ارسال فایل ناموفق بود؛ دوباره امتحان کن.")
+                except Exception as e:  # noqa: BLE001
+                    log(f"مونتاژ/ارسال بخش میانی فصلی ناموفق بود: {e}")
+                    send(chat, "❌ آماده‌سازی نسخهٔ میانی ناموفق بود؛ چند لحظهٔ دیگر دوباره بزن.")
+                finally:
+                    snap.unlink(missing_ok=True)
+                return
+            cands = []
+            if aj.get("part_pdf") and Path(aj["part_pdf"]).exists():
+                cands.append(Path(aj["part_pdf"]))
+            d = cp_dir(jkey)
+            if (d / "partial.pdf").exists():
+                cands.append(d / "partial.pdf")
+            src = cands[0] if cands else None
+            if src is None:
                 send(chat, "⏳ هنوز ذخیرهٔ میانگیری انجام نشده (هر ۲۵ صفحه یک‌بار ذخیره می‌شود)؛ "
                            "چند دقیقهٔ دیگر دوباره بزن.")
-            except TgError:
-                pass
-            return
-        snap = TMP_DIR / f"snap_{jkey}.pdf"
-        try:
-            shutil.copyfile(src, snap)
-            try:  # اعتبارسنجی: کپی وسط نوشتن می‌تواند ناقص باشد
-                with pymupdf.open(str(snap)) as _chk:
-                    _chk.page_count
-            except Exception:
-                snap.unlink(missing_ok=True)
-                try:
-                    send(chat, "⏳ همین لحظه در حال ذخیرهٔ میانگیری بودم؛ چند ثانیهٔ دیگر دوباره بزن.")
-                except TgError:
-                    pass
                 return
-            done = aj.get("last_done") or rec.get("done_pages") or 0
-            cap = (f"📥 بخش ترجمه‌شدهٔ «{html_mod.escape(str(aj.get('name') or rec.get('name') or 'فایل'))}» — "
-                   f"تا صفحهٔ {done:,} (بقیهٔ صفحات در فایل به‌صورت متن اصلی مانده)")
-            if deliver_file(chat, snap, cap):
-                try:
-                    send(chat, "ℹ️ این نسخهٔ میانی است؛ نسخهٔ کامل بعد از پایان ترجمه ارسال می‌شود.")
-                except TgError:
-                    pass
-            else:
-                send(chat, "❌ ارسال فایل ناموفق بود؛ دوباره امتحان کن.")
-        except Exception as e:  # noqa: BLE001
-            log(f"ارسال بخش میانی ناموفق بود: {e}")
+            snap = TMP_DIR / f"snap_{jkey}.pdf"
             try:
+                shutil.copyfile(src, snap)
+                try:  # اعتبارسنجی: کپی وسط نوشتن می‌تواند ناقص باشد
+                    with pymupdf.open(str(snap)) as _chk:
+                        _chk.page_count
+                except Exception:
+                    snap.unlink(missing_ok=True)
+                    send(chat, "⏳ همین لحظه در حال ذخیرهٔ میانگیری بودم؛ چند ثانیهٔ دیگر دوباره بزن.")
+                    return
+                done = aj.get("last_done") or rec.get("done_pages") or 0
+                cap = (f"📥 بخش ترجمه‌شدهٔ «{html_mod.escape(str(aj.get('name') or rec.get('name') or 'فایل'))}» — "
+                       f"تا صفحهٔ {done:,} (بقیهٔ صفحات در فایل به‌صورت متن اصلی مانده)")
+                if deliver_file(chat, snap, cap):
+                    try:
+                        send(chat, "ℹ️ این نسخهٔ میانی است؛ نسخهٔ کامل بعد از پایان ترجمه ارسال می‌شود.")
+                    except TgError:
+                        pass
+                else:
+                    send(chat, "❌ ارسال فایل ناموفق بود؛ دوباره امتحان کن.")
+            except Exception as e:  # noqa: BLE001
+                log(f"ارسال بخش میانی ناموفق بود: {e}")
                 send(chat, "❌ ارسال بخش میانی ناموفق بود؛ چند لحظهٔ دیگر دوباره بزن.")
-            except TgError:
-                pass
-        finally:
-            snap.unlink(missing_ok=True)
+            finally:
+                snap.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
     threading.Thread(target=_do, daemon=True, name="partial-send").start()
 
 
@@ -1201,8 +1625,12 @@ def handle_callback(cb: dict) -> None:
                     return
                 save_job_record(jkey, status="resuming")
                 job_q.put({"resume": jkey})
+                if rec.get("chapters"):
+                    rmsg = f"▶️ ادامهٔ ترجمه از فصل {(rec.get('chapters_done') or 0) + 1} در صف گذاشته شد."
+                else:
+                    rmsg = f"▶️ ادامهٔ ترجمه از صفحهٔ {(rec.get('done_pages') or 0) + 1:,} در صف گذاشته شد."
                 try:
-                    send(chat, f"▶️ ادامهٔ ترجمه از صفحهٔ {(rec.get('done_pages') or 0) + 1:,} در صف گذاشته شد.")
+                    send(chat, rmsg)
                 except TgError:
                     pass
                 return
@@ -1450,6 +1878,18 @@ def on_document(m: dict) -> None:
     if job_q.qsize() >= MAX_QUEUE:
         send(chat, "صف ربات پر است؛ چند دقیقه بعد دوباره امتحان کن.")
         return
+    # حذف تکراری: همین فایل (حجم یکسان از همین کاربر) قبلاً صف شده/در جریان است
+    with state_lock:
+        dup = any(int((r or {}).get("uid") or -1) == uid and int((r or {}).get("size") or -2) == fsize
+                  and (r or {}).get("status") in ("queued", "ask", "paused", "resuming",
+                                                  "failed_cycle")
+                  for r in (state.get("jobs") or {}).values())
+    if not dup:
+        dup = any(j.get("uid") == uid and j.get("size") == fsize for j in list(job_q.queue))
+    if dup:
+        send(chat, "⏳ همین فایل قبلاً در صف یا حال ترجمه است (خودکار ادامه می‌گیرد)؛ "
+                   "نیازی به فرستادن دوباره نیست.")
+        return
     user_pending.add(uid)
     jobkey = f"{uid}_{int(time.time())}"
     job_q.put({"chat": chat, "uid": uid, "file_id": doc["file_id"],
@@ -1473,19 +1913,42 @@ def process_job(job: dict) -> None:
         if not (d / "in.pdf").exists() and rec.get("ref_in") and GH_TOKEN and GH_REPO:
             gh_store.download_release_file(GH_REPO, GH_TOKEN, rec["ref_in"], d,
                                            fname="in.pdf", log=log)
-        if (d / "in.pdf").exists() and not (d / "partial.pdf").exists() \
-                and rec.get("ref_pp") and GH_TOKEN and GH_REPO:
-            gh_store.download_release_file(GH_REPO, GH_TOKEN, rec["ref_pp"], d,
-                                           fname="partial.pdf", log=log)
-        if not (d / "in.pdf").exists() or not (d / "partial.pdf").exists():
-            log(f"چک‌پوینت {jobkey} ناقص است (in/partial).")
-            drop_job_record(jobkey)
-            try:
-                send(rec.get("chat"), "⚠️ ادامهٔ ترجمه ممکن نشد (چک‌پوینت در دسترس نبود). "
-                                      "لطفاً فایل را دوباره بفرست.")
-            except TgError:
-                pass
-            return
+        ch_mode = bool(rec.get("chapters"))
+        if ch_mode:
+            # فصل‌ها: هر چک‌پوینت فصل، تگ خودش را دارد
+            refs = list(rec.get("ch_refs") or [])
+            for i, ref in enumerate(refs):
+                f = d / f"ch_{i:03d}.pdf"
+                if ref and not f.exists() and GH_TOKEN and GH_REPO:
+                    if gh_store.download_release_file(GH_REPO, GH_TOKEN, ref, d,
+                                                      fname="ch.pdf", log=log):
+                        try:
+                            (d / "ch.pdf").rename(f)
+                        except Exception:  # noqa: BLE001
+                            pass
+            if not (d / "in.pdf").exists():
+                log(f"چک‌پوینت {jobkey} ناقص است (in.pdf).")
+                drop_job_record(jobkey)
+                try:
+                    send(rec.get("chat"), "⚠️ ادامهٔ ترجمه ممکن نشد (چک‌پوینت در دسترس نبود). "
+                                          "لطفاً فایل را دوباره بفرست.")
+                except TgError:
+                    pass
+                return
+        else:
+            if (d / "in.pdf").exists() and not (d / "partial.pdf").exists() \
+                    and rec.get("ref_pp") and GH_TOKEN and GH_REPO:
+                gh_store.download_release_file(GH_REPO, GH_TOKEN, rec["ref_pp"], d,
+                                               fname="partial.pdf", log=log)
+            if not (d / "in.pdf").exists() or not (d / "partial.pdf").exists():
+                log(f"چک‌پوینت {jobkey} ناقص است (in/partial).")
+                drop_job_record(jobkey)
+                try:
+                    send(rec.get("chat"), "⚠️ ادامهٔ ترجمه ممکن نشد (چک‌پوینت در دسترس نبود). "
+                                          "لطفاً فایل را دوباره بفرست.")
+                except TgError:
+                    pass
+                return
         job = {"chat": rec.get("chat"), "uid": rec.get("uid"), "name": rec.get("name"),
                "size": rec.get("size"), "uname": rec.get("uname"), "jobkey": jobkey,
                "mode": rec.get("mode") or "auto"}
@@ -1526,7 +1989,7 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
         if resume_rec:
             d = cp_dir(jobkey)
             in_pdf = d / "in.pdf"
-            partial_old = d / "partial.pdf"
+            partial_old = d / "partial.pdf" if (d / "partial.pdf").exists() else None
             done_old = int(resume_rec.get("done_pages") or 0)
             n_pages = int(resume_rec.get("pages_total") or 0)
             try:
@@ -1536,10 +1999,25 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
             except Exception:
                 n_pages = 0
             range_ = job.get("range")
-            upd(f"▶️ ادامهٔ ترجمهٔ «{html_mod.escape(name)}» از صفحهٔ {done_old + 1:,}…",
+            # فصل‌به‌فصل: فهرست فصل‌ها + تعداد فصل‌های کامل‌شده از فایل‌های موجود
+            chapters = None
+            start_k = 0
+            if resume_rec.get("chapters"):
+                try:
+                    chapters = json.loads(resume_rec["chapters"])
+                except Exception:  # noqa: BLE001
+                    chapters = None
+            if chapters:
+                start_k = sum(1 for i in range(len(chapters))
+                              if (d / f"ch_{i:03d}.pdf").exists())
+                done_old = chapters[start_k - 1]["e"] if start_k else 0
+            upd(f"▶️ ادامهٔ ترجمهٔ «{html_mod.escape(name)}» "
+                + (f"از فصل {start_k + 1}/{len(chapters)}…" if chapters
+                   else f"از صفحهٔ {done_old + 1:,}…"),
                 force=True, kb=job_progress_kb(jobkey))
         else:
             partial_old, done_old = None, 0
+            chapters, start_k = None, 0
             # ── دانلود: فایل‌های ≤۱۹MB از Bot API؛ بزرگ‌تر از طریق MTProto (تا ~۲GB)
             try:
                 if fsize > MAX_DOWNLOAD:
@@ -1660,7 +2138,7 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
         #    وگرنه شروع می‌شود حتی اگر کامل نشود — چون چک‌پوینت می‌گیریم
         if RUN_MAX_MINUTES:
             needed_min = 5 + (re_ - done_old) * SEC_PER_PAGE_EST / 60
-            remaining_min = (start_ts + JOB_HARD_MINUTES * 60) - time.time()
+            remaining_min = ((start_ts + JOB_HARD_MINUTES * 60) - time.time()) / 60.0
             if remaining_min < MIN_CYCLE_LEFT_MIN and not resume_rec:
                 wait_min = max(int(RUN_MAX_MINUTES - (time.time() - start_ts) / 60) + 5, 5)
                 save_job_record(jobkey, status="queued", chat=chat, uid=uid,
@@ -1691,6 +2169,15 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
         t0 = time.time()
         mode_note = " | 🖼 عکس‌محور (OCR)" if mode == "image" else ""
 
+        # ── فصل‌به‌فصل برای فایل‌های بزرگ (کتاب) — فقط کار تازه؛ ادامه از رکورد می‌آید ──
+        if chapters is None and not resume_rec and (re_ - rs + 1) >= CHAPTER_MIN_PAGES:
+            try:
+                chapters = book_chapters(in_pdf, rs, re_)
+            except Exception:  # noqa: BLE001
+                chapters = None
+            if not chapters or len(chapters) < 2:
+                chapters = None
+
         def progress(rel_done: int, rel_total: int) -> None:
             done_abs = done_old + rel_done
             aj["last_done"] = done_abs
@@ -1705,7 +2192,16 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
                 upd(f"📖 آماده‌سازی: متنِ {rel_done:,}/{rel_total:,} صفحه استخراج شد…",
                     kb=job_progress_kb(jobkey))
 
-        if resume_rec:
+        if chapters:
+            ch_first = chapters[min(start_k, len(chapters) - 1)]
+            upd(f"📚 این کتاب <b>{len(chapters)}</b> فصل دارد — <b>فصل‌به‌فصل</b> ترجمه می‌کنم و "
+                "بعد از هر فصل گزارش می‌دهم. هایلایت‌های متن اصلی هم حذف و طبق ترجمه دوباره گذاشته "
+                "می‌شوند و هیچ صفحه‌ای خالی نمی‌ماند.\n"
+                f"▶️ شروع از فصل {min(start_k, len(chapters) - 1) + 1}: "
+                f"«{html_mod.escape(ch_first['t'])}» (صفحات {ch_first['s']:,}–{ch_first['e']:,}) "
+                f"با <code>{eng['model']}</code>{mode_note}",
+                force=True, kb=job_progress_kb(jobkey))
+        elif resume_rec:
             upd(f"🌍 ادامهٔ ترجمه از صفحهٔ {done_old + 1:,} تا {re_:,} با <code>{eng['model']}</code>…",
                 force=True, kb=job_progress_kb(jobkey))
         else:
@@ -1713,8 +2209,10 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
                 f"({LANG_LABEL.get(src_lang, src_lang)} → {LANG_LABEL.get(dst_lang, dst_lang)})"
                 f"{mode_note}…",
                 force=True, kb=job_progress_kb(jobkey))
-        aj["part_pdf"] = str(out_pdf.with_suffix(".part.pdf"))  # برای دکمهٔ «دریافت تا اینجا»
+        if not chapters:
+            aj["part_pdf"] = str(out_pdf.with_suffix(".part.pdf"))  # برای دکمهٔ «دریافت تا اینجا»
 
+        ch_agg = None
         # سرویس ترجمه فقط برای همین ترجمه «روشن» و بعد از کار «خاموش» می‌شود (ضد بن)
         try:
             opencode_arm()
@@ -1723,48 +2221,80 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
             in_pdf.unlink(missing_ok=True)
             return
         try:
-            res = core.translate_pdf(
-                str(in_pdf), str(out_pdf), "", model=eng["model"],
-                base_url="", workers=w, spacing=sp,
-                progress=progress, cancelled=job_pause,
-                extract_progress=extract_progress,
-                # ادامه: done_old اندیس مطلقِ اولین صفحهٔ ترجمه‌نشده است؛
-                # کار تازه: شروع از ابتدای بازه (rs-1)
-                start_page=done_old if resume_rec else (rs - 1), end_page=re_,
-                log=lambda *a: None, mirror=True,
-                src_lang=src_lang, dst_lang=dst_lang, use_cli=True,
-                oc_bin=OC_BIN, oc_cwd=str(TMP_DIR),
-                page_mode=mode, ocr_langs=core.tess_lang_for(src_lang),
-                img_quality=imgq)
-        except core.FatalTranslationError as err:
-            alert_admin_provider_down("OpenCode Zen", err)
-            upd("❌ ترجمه انجام نشد: " + short_err(err) + "\nبه ادمین خبر بده.", force=True)
-            if not resume_rec:
-                in_pdf.unlink(missing_ok=True)
-            return
-        except core.TranslationError as err:
-            upd(f"❌ ترجمه ناتمام ماند: {short_err(err)}\n"
-                "سرویس ترجمه شلوغ است؛ چند دقیقه بعد دوباره امتحان کن.", force=True)
-            if not resume_rec:
-                in_pdf.unlink(missing_ok=True)
-            return
-        except Exception as e:  # noqa: BLE001
-            traceback.print_exc()  # استک کامل در لاگ Actions برای دیباگ
-            upd(f"❌ خطای غیرمنتظره در ترجمه: <code>{html_mod.escape(str(e))[:140]}</code>",
-                force=True)
-            if not resume_rec:
-                in_pdf.unlink(missing_ok=True)
-            return
+            if chapters:
+                ctx = {"jobkey": jobkey, "chat": chat, "uid": uid, "aj": aj, "upd": upd,
+                       "in_pdf": in_pdf, "rs": rs, "re_": re_, "chapters": chapters,
+                       "start_k": start_k, "ref_in": (resume_rec or {}).get("ref_in") or "",
+                       "ch_refs": list((resume_rec or {}).get("ch_refs") or []),
+                       "w": w, "sp": sp, "eng": eng, "mode": mode,
+                       "src_lang": src_lang, "dst_lang": dst_lang, "imgq": imgq,
+                       "name": name, "n_pages": n_pages}
+                cres = _translate_by_chapters(ctx)
+                ch_agg = cres.get("agg") or {}
+                if cres["status"] == "paused":
+                    return
+                if cres["status"] == "failed":
+                    err = cres["err"]
+                    if cres.get("kind") == "fatal":
+                        alert_admin_provider_down("OpenCode Zen", err)
+                    upd("❌ ترجمه در فصل «...» ناتمام ماند: " + short_err(err) + "\n"
+                        "✅ فصل‌های کامل‌شده ذخیره شده‌اند؛ دوباره امتحان کن تا از همان فصل ادامه دهم.",
+                        force=True)
+                    return
+                res = cres["res"]
+                rel_translated = int((res or {}).get("translated", 0) or 0)
+                done_abs = re_
+            else:
+                try:
+                    res = core.translate_pdf(
+                        str(in_pdf), str(out_pdf), "", model=eng["model"],
+                        base_url="", workers=w, spacing=sp,
+                        progress=progress, cancelled=job_pause,
+                        extract_progress=extract_progress,
+                        # ادامه: done_old اندیس مطلقِ اولین صفحهٔ ترجمه‌نشده است؛
+                        # کار تازه: شروع از ابتدای بازه (rs-1)
+                        start_page=done_old if resume_rec else (rs - 1), end_page=re_,
+                        log=lambda *a: None, mirror=True,
+                        src_lang=src_lang, dst_lang=dst_lang, use_cli=True,
+                        oc_bin=OC_BIN, oc_cwd=str(TMP_DIR),
+                        page_mode=mode, ocr_langs=core.tess_lang_for(src_lang),
+                        img_quality=imgq)
+                except core.FatalTranslationError as err:
+                    alert_admin_provider_down("OpenCode Zen", err)
+                    upd("❌ ترجمه انجام نشد: " + short_err(err) + "\nبه ادمین خبر بده.", force=True)
+                    if not resume_rec:
+                        in_pdf.unlink(missing_ok=True)
+                    return
+                except core.TranslationError as err:
+                    upd(f"❌ ترجمه ناتمام ماند: {short_err(err)}\n"
+                        "سرویس ترجمه شلوغ است؛ چند دقیقه بعد دوباره امتحان کن.", force=True)
+                    if not resume_rec:
+                        in_pdf.unlink(missing_ok=True)
+                    return
+                except Exception as e:  # noqa: BLE001
+                    traceback.print_exc()  # استک کامل در لاگ Actions برای دیباگ
+                    upd(f"❌ خطای غیرمنتظره در ترجمه: <code>{html_mod.escape(str(e))[:140]}</code>",
+                        force=True)
+                    if not resume_rec:
+                        in_pdf.unlink(missing_ok=True)
+                    return
+                rel_translated = int((res or {}).get("translated", 0) or 0)
+                done_abs = done_old + rel_translated
         finally:
             opencode_disarm()
 
         usage = (res or {}).get("usage", {})
         total_tokens = int(usage.get("total_tokens", 0) or 0)
         secs = time.time() - t0
-        failed_n = len((res or {}).get("failed_pages", []))
-        skipped_n = len((res or {}).get("skipped_pages", []))
+        if ch_agg is not None:
+            failed_n = int(ch_agg.get("failed", 0) or 0)
+            skipped_n = int(ch_agg.get("skipped", 0) or 0)
+        else:
+            failed_n = len((res or {}).get("failed_pages", []))
+            skipped_n = len((res or {}).get("skipped_pages", []))
         rel_translated = int((res or {}).get("translated", 0) or 0)
-        done_abs = done_old + rel_translated
+        if not chapters:
+            done_abs = done_old + rel_translated
 
         # ── توقف موقت / پایان چرخه: چک‌پوینت بگیر و خبر بده
         if (res or {}).get("cancelled"):
@@ -1805,14 +2335,23 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
 
         # ── موفقیت: ادغام پیشرفت قبلی (اگر ادامه بود)، تحویل، پاکسازی
         upd("📤 در حال آماده‌سازی و ارسال فایل ترجمه‌شده…", force=True)
-        final_path = out_pdf
-        if resume_rec and done_old > 0 and partial_old and partial_old.exists():
-            final_path = TMP_DIR / f"{uid}_{stamp}_final.pdf"
-            merge_partials(partial_old, out_pdf, done_old, final_path)
-            out_pdf.unlink(missing_ok=True)
+        if chapters:
+            final_path = Path((res or {}).get("output") or "")
+            if not final_path.exists():
+                upd("❌ فایل نهایی مونتاژشده پیدا نشد؛ دوباره امتحان کن.", force=True)
+                return
+        else:
+            final_path = out_pdf
+            if resume_rec and done_old > 0 and partial_old and partial_old.exists():
+                final_path = TMP_DIR / f"{uid}_{stamp}_final.pdf"
+                merge_partials(partial_old, out_pdf, done_old, final_path)
+                out_pdf.unlink(missing_ok=True)
 
         out_mb = final_path.stat().st_size / (1024 * 1024)
-        if range_ and done_abs < re_:
+        if chapters:
+            cap = (f"✅ ترجمهٔ کامل «{html_mod.escape(name)}» — {re_ - rs + 1:,} صفحه در "
+                   f"{secs / 60:.1f} دقیقه ({len(chapters)} فصل) | حجم: {out_mb:.1f}MB")
+        elif range_ and done_abs < re_:
             cap = (f"✅ ترجمهٔ «{html_mod.escape(name)}» — صفحات {_fmt_pages(rs, re_)} در "
                    f"{secs / 60:.1f} دقیقه | حجم: {out_mb:.1f}MB")
         else:
@@ -1820,12 +2359,15 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
                    f"{secs / 60:.1f} دقیقه | حجم: {out_mb:.1f}MB")
         warn = ""
         if failed_n:
-            warn += f"\n⚠️ {failed_n} صفحه به‌خاطر خطای سرویس ترجمه نشد (متن اصلی ماند)."
+            warn += f"\n⚠️ {failed_n} بخش به‌خاطر خطای سرویس ترجمه نشد (متن اصلی همان بخش ماند)."
         if skipped_n:
             warn += f"\n⚠️ {skipped_n} صفحه متن قابل استخراج نداشت (بدون تغییر کپی شد)."
         ocr_n = int((res or {}).get("ocr_pages", 0) or 0)
         if ocr_n:
             warn += f"\n🖼 {ocr_n} صفحه با OCR ترجمه شد (متن از تصویر برداشته شد)."
+        hl_n = int((res or {}).get("hl_applied", 0) or 0)
+        if hl_n:
+            warn += f"\n🖍 {hl_n:,} هایلایت حذف و طبق ترجمه دوباره گذاشته شد."
         cap += warn
 
         upd("📤 در حال ارسال فایل ترجمه‌شده…", force=True)
@@ -1836,10 +2378,29 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
             final_path.unlink(missing_ok=True)
             return
 
+        # کپی خروجی برای ادمین به آدرس درخواستی (فقط کارهای خودِ ادمین)
+        if chapters and uid == ADMIN_ID:
+            cid = extra_delivery_chat()
+            if cid and cid != chat:
+                try:
+                    if deliver_file(cid, final_path,
+                                    f"📘 کپی ترجمهٔ «{html_mod.escape(name)}» ({out_mb:.1f}MB)"):
+                        try:
+                            send(chat, f"📨 یک نسخه هم به {DELIVERY_EXTRA} ارسال شد.")
+                        except TgError:
+                            pass
+                except Exception as e:  # noqa: BLE001
+                    log(f"ارسال کپی به {DELIVERY_EXTRA} ناموفق بود: {e}")
+
         # پاکسازی چک‌پوینت و رکورد
-        for old_ref in ((resume_rec or {}).get("ref_in") or "",
-                        (resume_rec or {}).get("ref_pp") or ""):
-            gh_store.cleanup_release(GH_REPO, GH_TOKEN, old_ref)
+        old_refs = [(resume_rec or {}).get("ref_in") or "",
+                    (resume_rec or {}).get("ref_pp") or ""]
+        if chapters:
+            old_refs += list((resume_rec or {}).get("ch_refs") or [])
+            old_refs += list(cres.get("ch_refs") or [])
+        for old_ref in old_refs:
+            if old_ref:
+                gh_store.cleanup_release(GH_REPO, GH_TOKEN, old_ref)
         shutil.rmtree(cp_dir(jobkey), ignore_errors=True)
         drop_job_record(jobkey)
 
@@ -1858,6 +2419,12 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
 
         if in_pdf.exists() and not resume_rec:
             in_pdf.unlink(missing_ok=True)
+        if chapters:
+            # فایل‌های فصل و مونتاژ دیگر لازم نیستند
+            try:
+                Path(str((res or {}).get("output") or "")).unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
         if not ADMIN_ID:
             return
         try:

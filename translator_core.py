@@ -425,6 +425,121 @@ def _split_blocks_by_tables(page: "pymupdf.Page", blocks: list[dict],
     return out
 
 
+# --------------------------------------------------------------------------
+# هایلایت‌ها — انتقال هایلایتِ متنِ اصلی onto ترجمه
+# --------------------------------------------------------------------------
+
+HL_MARK_TYPES = ("Highlight", "Underline", "Squiggly", "StrikeOut")
+HL_DEFAULT_COLOR = (1.0, 0.9, 0.2)
+
+
+def _page_highlights(page: "pymupdf.Page") -> list[tuple["pymupdf.Rect", tuple[float, float, float]]]:
+    """مستطیل و رنگ هایلایت‌های واقعی (Annotation) صفحه.
+
+    فقط انواع علامت‌گذاریِ متن (هایلایت/زیرخط/…) — با این فرض که روی متن نشسته‌اند.
+    رنگ از خود حاشیه‌نویسی خوانده می‌شود (پیش‌فرض: زرد استاندارد)."""
+    out: list[tuple["pymupdf.Rect", tuple[float, float, float]]] = []
+    try:
+        for a in (page.annots() or []):
+            try:
+                if a.type[1] not in HL_MARK_TYPES:
+                    continue
+                r = pymupdf.Rect(a.rect)
+                if r.is_empty or r.is_infinite or r.width <= 1 or r.height <= 1:
+                    continue
+                col = HL_DEFAULT_COLOR
+                try:
+                    c = (a.colors or {}).get("stroke") or []
+                    if len(c) >= 3:
+                        col = tuple(max(0.0, min(1.0, float(x))) for x in c[:3])
+                except Exception:  # noqa: BLE001
+                    pass
+                out.append((r, col))
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def _split_blocks_by_highlights(
+        blocks: list[dict], hl: list[tuple["pymupdf.Rect", tuple[float, float, float]]],
+        log=print) -> tuple[list[dict], int, int]:
+    """بلوک‌ها را در مرزِ خط‌های هایلایت‌شده می‌شکند.
+
+    خروجی: (بلوک‌های جدید، تعداد بخش‌های هایلایت‌شده، تعداد هایلایت بی‌اثر)
+    بخش‌های هایلایت‌شده با فلگ _hl=True و رنگ _hl_color مشخص می‌شوند تا بعد از
+    ترجمه، هایلایتِ تازه دقیقاً زیر همان بخش از ترجمه بنشیند. هایلایت‌هایی که
+    هیچ خط متنی باشان همپوشانی نداشتند (روی عکس/حاشیه) به‌عنوان بی‌اثر گزارش می‌شوند.
+    """
+    if not hl or not blocks:
+        return blocks, 0, 0
+    n_hl = 0
+    used = [False] * len(hl)
+    out: list[dict] = []
+    for b in blocks:
+        lrs = b["line_rects"]
+        raws = list(b.get("raw_lines") or [])
+        if len(raws) < len(lrs):
+            raws += [""] * (len(lrs) - len(raws))
+        marks: list[bool] = [False] * len(lrs)
+        mark_color: dict[int, tuple[float, float, float]] = {}
+        for li, lr in enumerate(lrs):
+            la = max(lr.width * lr.height, 1e-6)
+            for hi, (hr, col) in enumerate(hl):
+                it = lr & hr
+                if it.is_empty:
+                    continue
+                ia = it.width * it.height
+                ha = max(hr.width * hr.height, 1e-6)
+                # هم پوششِ چشمگیرِ خط، هم هایلایتِ کوچکِ درونِ خط (مثل چند کلمه)
+                if ia / la >= 0.35 or ia / ha >= 0.5:
+                    marks[li] = True
+                    used[hi] = True
+                    mark_color.setdefault(li, col)
+                    break
+        if not any(marks):
+            out.append(b)
+            continue
+        if all(marks):
+            # کل بلوک هایلایت است — دست‌نخورده نگه داشته می‌شود
+            b["_hl"] = True
+            b["_hl_color"] = mark_color.get(0, HL_DEFAULT_COLOR)
+            n_hl += 1
+            out.append(b)
+            continue
+        # شکستن به ران‌های پیوستهٔ هایلایت/غیرهایلایت
+        runs: list[dict] = []
+        cur: dict | None = None
+        for li, m in enumerate(marks):
+            if cur is None or cur["hl"] != m:
+                cur = {"hl": m, "idx": []}
+                runs.append(cur)
+            cur["idx"].append(li)
+        for run in runs:
+            nb = {k: v for k, v in b.items()
+                  if k not in ("bbox", "line_rects", "raw_lines", "text", "_hl", "_hl_color")}
+            nb["line_rects"] = [lrs[i] for i in run["idx"]]
+            nb["raw_lines"] = [raws[i] for i in run["idx"]]
+            nb["text"] = _join_lines(nb["raw_lines"])
+            if not nb["text"].strip():
+                continue
+            nb["bbox"] = _union_rects(nb["line_rects"])
+            if nb["bbox"].is_empty or nb["bbox"].width <= 2 or nb["bbox"].height <= 2:
+                continue
+            nb["align"] = _detect_align(nb["bbox"], nb["line_rects"])
+            if run["hl"]:
+                nb["_hl"] = True
+                nb["_hl_color"] = mark_color.get(run["idx"][0], HL_DEFAULT_COLOR)
+                n_hl += 1
+            out.append(nb)
+    dropped = sum(1 for u in used if not u)
+    if n_hl or dropped:
+        log(f"هایلایت‌ها: {n_hl} بخش متنِ هایلایت‌شده برای انتقال روی ترجمه جدا شد"
+            + (f"؛ {dropped} هایلایت روی متن نبود (عکس/حاشیه) و حذف می‌شود." if dropped else "."))
+    return out, n_hl, dropped
+
+
 def _batch_items(items: list[tuple[int, str]], max_chars: int = 12000) -> list[list[tuple[int, str]]]:
     """دسته‌بندی آیتم‌ها بر اساس حجم کاراکتر (بچ بزرگ‌تر = فراخوانی CLI کمتر = سریع‌تر)."""
     batches, cur, size = [], [], 0
@@ -1043,6 +1158,25 @@ def _apply_redactions(page: "pymupdf.Page") -> None:
         page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE)
 
 
+def _delete_annotations(page: "pymupdf.Page") -> int:
+    """حذف همهٔ حاشیه‌نویسی‌های صفحه (هایلایت‌های قدیمی و…).
+
+    هایلایت‌های اصلی با متن انگلیسی سر جای قبلی‌شان می‌مانند و بعد از ترجمه
+    بهم‌ریخته و جابه‌جا دیده می‌شوند؛ به‌جای آن‌ها هایلایت تازه طبق ترجمه گذاشته
+    می‌شود. تعداد حذف‌شده‌ها برمی‌گردد."""
+    n = 0
+    try:
+        for a in list(page.annots() or []):
+            try:
+                page.delete_annot(a)
+                n += 1
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return n
+
+
 def _remove_images(page: "pymupdf.Page", bboxes: list["pymupdf.Rect"]) -> None:
     """حذف استقرار تصاویر از صفحه (برای بازدرج در موقعیت آینه‌ای)."""
     for r in bboxes:
@@ -1207,7 +1341,8 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                   start_page: int = 0, end_page: int | None = None,
                   extract_progress=None,
                   page_mode: str = "auto", ocr_langs: str = "",
-                  ocr_workers: int = 3, img_quality: str = "small") -> dict:
+                  ocr_workers: int = 3, img_quality: str = "small",
+                  plain_save: bool = False) -> dict:
     """
     ترجمهٔ کامل فایل PDF به زبان مقصد با حفظ چیدمان.
 
@@ -1257,6 +1392,7 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
     stats = {"pages": total_all, "range_start": p_start, "range_end": p_end,
              "translated": 0, "no_text_pages": 0, "ocr_pages": 0,
              "failed_pages": [], "skipped_pages": [],
+             "hl_applied": 0, "hl_dropped": 0, "annots_removed": 0,
              "output": str(out_path), "cancelled": False,
              "usage": usage}
 
@@ -1274,6 +1410,31 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
             api_key, model, segs_b, log=log, base_url=base_url,
             src_lang=src_lang, dst_lang=dst_lang,
             usage_acc=usage, usage_lock=usage_lock)
+
+    # مدارشکن: شمارش شکست‌های پشت‌سرهمِ دسته‌ها؛ اگر سرویس مرده باشد به‌جای
+    # سوزاندن ساعت‌ها و ساختن ده‌ها صفحهٔ خالی/بدون ترجمه، کل اجرا متوقف می‌شود
+    consec_fail = {"n": 0}
+
+    def _call_batch_guarded(batch):
+        """فراخوانی بچ با یک تلاش مجدد بیرونی + مدارشکن قطع کامل سرویس."""
+        for att in range(2):
+            try:
+                outs = _call_batch(batch)
+                consec_fail["n"] = 0
+                return outs
+            except FatalTranslationError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                if att == 0:
+                    log(f"دستهٔ ترجمه ناموفق بود ({e})؛ ۲۰ ثانیه صبر و تلاش دوباره…")
+                    time.sleep(20.0)
+                else:
+                    consec_fail["n"] += 1
+                    if consec_fail["n"] >= 8:
+                        raise FatalTranslationError(
+                            "سرویس ترجمه ۸ دستهٔ پشت‌سرهم را بی‌پاسخ گذاشت؛ اجرا متوقف شد "
+                            "تا چک‌پوینت گرفته شود و چرخهٔ بعد ادامه دهد.", code="provider")
+                    raise
 
     pool = None
     if workers > 1 and translator is None:
@@ -1344,7 +1505,7 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
 
         tasks = []
         for batch in _batch_items(items):
-            fut = pool.submit(_call_batch, batch) if pool is not None else None
+            fut = pool.submit(_call_batch_guarded, batch) if pool is not None else None
             for out_idx, (_i, s) in enumerate(batch):
                 with cache_lock:
                     pending.setdefault(s.strip(), (fut, out_idx))
@@ -1364,6 +1525,8 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                 break
             try:
                 page = doc[pno]
+                # هایلایت‌های صفحه باید قبل از هر تغییری خوانده شوند
+                hl = _page_highlights(page)
                 blocks = extract_blocks(page)
                 if page_mode == "image" and ocr_pool is not None:
                     # کاربر گفته عکس‌محور است؛ OCR اولویت دارد (لایهٔ متن، پشتیبان می‌ماند)
@@ -1372,7 +1535,7 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                     continue
                 if not blocks and page_mode == "auto" and ocr_pool is not None:
                     fut = ocr_pool.submit(ocr_page_blocks, page, tess_langs, 200, log)
-                    page_jobs.append({"pno": pno, "fut": fut, "text_fallback": []})
+                    page_jobs.append({"pno": pno, "fut": fut, "text_fallback": [], "hl": hl})
                     continue
                 if not blocks:
                     stats["no_text_pages"] += 1
@@ -1383,10 +1546,19 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                 blocks = _merge_overlapping_blocks(blocks)
                 # جدول‌ها: هر سلول یک بلوک مستقل تا ترجمه از خانه بیرون نزند
                 blocks = _split_blocks_by_tables(page, blocks, log=log)
+                # هایلایت‌های صفحه: بلوک‌ها در مرز خط‌های هایلایت‌شده می‌شکنند تا
+                # هایلایت تازه دقیقاً روی ترجمهٔ همان بخش بنشیند
+                n_hl = n_drop = 0
+                if hl:
+                    blocks, n_hl, n_drop = _split_blocks_by_highlights(blocks, hl, log=log)
+                    stats["hl_applied"] += n_hl
+                    stats["hl_dropped"] += n_drop
                 # جهت متن (راست‌چین/چپ‌چین) بر اساس زبان مقصد
                 for b in blocks:
                     b["_rtl"] = rtl
-                page_jobs.append(_enqueue_page(pno, blocks))
+                pj = _enqueue_page(pno, blocks)
+                pj["hl"] = hl
+                page_jobs.append(pj)
             except FatalTranslationError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -1415,7 +1587,9 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                 stats["ocr_pages"] += 1
                 for b in oblocks:
                     b["_rtl"] = rtl
-                resolved.append(_enqueue_page(pno, oblocks))
+                pj2 = _enqueue_page(pno, oblocks)
+                pj2["hl"] = pj.get("hl") or []
+                resolved.append(pj2)
             elif pj.get("text_fallback"):
                 resolved.append(_enqueue_page(pno, pj["text_fallback"]))
             else:
@@ -1441,18 +1615,21 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
             # کل بازسازی صفحه در برابر خطاهای غیرمنتظره مقاوم شده تا یک صفحهٔ ناساز
             # هیچ‌وقت فایل چندصفحه‌ای (تا ۲۰۰۰ صفحه) را نیمه‌کاره نکشد.
             try:
+                # نتیجهٔ بچ‌های ترجمهٔ همین صفحه گرفته می‌شود
                 for batch, fut in tasks:
                     try:
-                        outs = fut.result() if fut is not None else _call_batch(batch)
+                        outs = fut.result() if fut is not None else _call_batch_guarded(batch)
                     except FatalTranslationError:
                         raise
                     except TranslationError as e:
                         stats["failed_pages"].append(pno + 1)
-                        log(f"صفحهٔ {pno + 1}: {e} — متن اصلیِ این بخش حفظ شد.")
+                        log(f"صفحهٔ {pno + 1}: {e} — متن اصلیِ بلوک‌های این بخش حفظ می‌شود "
+                            "(صفحه خالی نمی‌شود).")
                         outs = None
                     except Exception as e:  # noqa: BLE001
                         stats["failed_pages"].append(pno + 1)
-                        log(f"صفحهٔ {pno + 1}: خطای غیرمنتظره در ترجمهٔ بخش ({e}) — متن اصلی حفظ شد.")
+                        log(f"صفحهٔ {pno + 1}: خطای غیرمنتظره در ترجمهٔ بخش ({e}) — "
+                            "متن اصلیِ بلوک‌های این بخش حفظ می‌شود.")
                         log(traceback.format_exc())
                         outs = None
                     if outs is not None:
@@ -1478,13 +1655,21 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
 
                 ocr_page = all(b.get("_ocr") for b in blocks)
 
-                # ۱) حذف متن اصلی صفحه
+                # ۰) حذف هایلایت‌ها و حاشیه‌نویسی‌های اصلی — هایلایت تازه طبق ترجمه گذاشته می‌شود
+                stats["annots_removed"] += _delete_annotations(page)
+
+                has_trans = [bool((trans[i] or "").strip()) for i in range(len(blocks))]
+
+                # ۱) حذف متن اصلی فقط برای بلوک‌هایی که ترجمه دارند؛
+                #    بلوک بدون ترجمه (خطای سرویس) متن اصلی‌اش حفظ می‌شود تا صفحه خالی نشود
                 if ocr_page:
                     # متن داخل تصویر است: فشرده‌سازی شدید صفحه + پوشش هم‌رنگِ محل متن
                     if img_quality != "high":
                         _rasterize_page(page, 100 if img_quality == "small" else 120,
                                         60 if img_quality == "small" else 70, log)
-                    for b in blocks:
+                    for i, b in enumerate(blocks):
+                        if not has_trans[i]:
+                            continue
                         fr = pymupdf.Rect(b["bbox"].x0 - 1.0, b["bbox"].y0 - 1.0,
                                           b["bbox"].x1 + 1.0, b["bbox"].y1 + 1.0)
                         fr.intersect(page.rect)
@@ -1496,7 +1681,9 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                             pass
                 else:
                     # حذف متن اصلی صفحه (تصاویر و گرافیک دست‌نخورده می‌مانند)
-                    for b in blocks:
+                    for i, b in enumerate(blocks):
+                        if not has_trans[i]:
+                            continue
                         for r in b["line_rects"]:
                             pr = pymupdf.Rect(r.x0 - 0.5, r.y0 - 0.5, r.x1 + 0.5, r.y1 + 0.5)
                             page.add_redact_annot(pr, fill=False)
@@ -1548,7 +1735,8 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                 page_scale = max(min(para_scales), 0.62) if para_scales else 1.0
                 page_scale = min(page_scale, 1.0)
 
-                # ۴) درج ترجمهٔ فارسی
+                # ۴) درج ترجمهٔ فارسی؛ برای بلوک‌های هایلایت‌دار بعد از درج،
+                #    هایلایت با اندازهٔ واقعی متن روی همان ناحیه کشیده می‌شود
                 for i, (b, t) in enumerate(zip(blocks, trans)):
                     t = (t or "").strip()
                     if not t:
@@ -1569,6 +1757,28 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
                             log(f"صفحهٔ {pno + 1}: یک بلوک برای جا شدن به {int(shrink * 100)}٪ کوچک شد.")
                     except Exception as e:  # noqa: BLE001
                         log(f"صفحهٔ {pno + 1}: درج متن ناموفق بود: {e}")
+                        _spare = None
+                    if b.get("_hl"):
+                        # هایلایت تازه — بعد از درج متن می‌کشیم تا اندازه‌اش دقیقاً
+                        # به‌اندازهٔ متن واقعیِ درج‌شده باشد (نه کل کادرِ اصلی)؛
+                        # نیمه‌شفاف است تا مثل ماژیکِ هایلایت، متن زیرش خوانا بماند.
+                        try:
+                            used_h = rect.height
+                            try:
+                                spare_f = float(_spare) if _spare is not None else None
+                            except Exception:  # noqa: BLE001
+                                spare_f = None
+                            if spare_f is not None and spare_f >= 0:
+                                used_h = min(max(rect.height - spare_f, 6.0), rect.height)
+                            hr = pymupdf.Rect(rect.x0 - 1.2, rect.y0 - 1.0,
+                                              rect.x1 + 1.2, rect.y0 + used_h + 1.0)
+                            hr.intersect(page.rect)
+                            if not hr.is_empty and hr.width > 1 and hr.height > 1:
+                                page.draw_rect(hr, color=None,
+                                               fill=b.get("_hl_color") or HL_DEFAULT_COLOR,
+                                               fill_opacity=0.45)
+                        except Exception:  # noqa: BLE001
+                            pass
 
                 stats["translated"] += 1
             except FatalTranslationError:
@@ -1616,7 +1826,12 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
         stats["output"] = str(tmp_path)
     else:
         try:
-            _finalize_save(doc, out_path, log, img_quality)
+            if plain_save:
+                # حالت فصل‌به‌فصل: فشرده‌سازی سنگین (بازفشرده‌سازی تصاویر/زیرمجموعهٔ فونت)
+                # فقط یک‌بار در مونتاژ نهایی انجام می‌شود — نه در هر فصل (افت کیفیت تجمعی ندارد)
+                doc.save(str(out_path), garbage=3, deflate=True)
+            else:
+                _finalize_save(doc, out_path, log, img_quality)
         except Exception as e:  # noqa: BLE001
             log(f"ذخیرهٔ نهایی ناموفق بود ({e})؛ ذخیرهٔ ساده…")
             try:
@@ -1629,7 +1844,11 @@ def translate_pdf(input_pdf, output_pdf, api_key, *, model=DEFAULT_MODEL, delay=
 
     dt = time.time() - t0
     ocr_note = f" | OCR: {stats['ocr_pages']} صفحه" if stats.get("ocr_pages") else ""
-    log(f"پایان: {stats['translated']} از {total} صفحه در {dt:.0f} ثانیه پردازش شد{ocr_note}. "
+    hl_note = ""
+    if stats.get("hl_applied") or stats.get("hl_dropped"):
+        hl_note = (f" | هایلایت: {stats['hl_applied']} بخش منتقل شد"
+                   + (f"، {stats['hl_dropped']} حذف شد" if stats.get("hl_dropped") else ""))
+    log(f"پایان: {stats['translated']} از {total} صفحه در {dt:.0f} ثانیه پردازش شد{ocr_note}{hl_note}. "
         f"خروجی: {stats['output']}")
     if usage:
         log(f"مصرف توکن: ورودی {usage.get('prompt_tokens', 0):,} | "

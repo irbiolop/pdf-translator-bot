@@ -49,32 +49,6 @@
   "tokens": 1235384
  },
  "jobs": {
-  "7433357700_1792708510": {
-   "status": "queued",
-   "chat": 7433357700,
-   "uid": 7433357700,
-   "name": "Robbins_&_Kumar_Basic_Pathology_11th_Edition.pdf",
-   "file_id": "BQACAgQAAxkBAANvatd0lZULjYVNS03vl39Nfd6pLI4AAr8gAAJiXjFSc53oik1VlIQ9BA",
-   "mid": 208,
-   "size": 167388515,
-   "pages_total": 936,
-   "mode": "auto",
-   "ts": 1792728749.1634574,
-   "asked": false
-  },
-  "7433357700_1792780833": {
-   "status": "queued",
-   "chat": 7433357700,
-   "uid": 7433357700,
-   "name": "Robbins_&_Kumar_Basic_Pathology_11th_Edition.pdf",
-   "file_id": "BQACAgQAAxkBAANvatd0lZULjYVNS03vl39Nfd6pLI4AAr8gAAJiXjFSc53oik1VlIQ9BA",
-   "mid": 230,
-   "size": 167388515,
-   "pages_total": 936,
-   "mode": "auto",
-   "ts": 1792801599.4896193,
-   "asked": false
-  },
   "7433357700_1792931934": {
    "status": "queued",
    "chat": 7433357700,
@@ -86,7 +60,7 @@
    "pages_total": 936,
    "mode": "auto",
    "ts": 1792943209.8297675,
-   "asked": false
+   "asked": true
   }
  }
 }
