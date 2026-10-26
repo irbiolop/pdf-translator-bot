@@ -153,6 +153,7 @@ DELIVERY_EXTRA = os.environ.get("DELIVERY_EXTRA", "@PrivateUssser").strip()
 state_lock = threading.RLock()
 dirty = threading.Event()
 job_q: "queue.Queue[dict]" = queue.Queue()
+superseded: set = set()  # کارهایی که با آپلود تازهٔ همان فایل جایگزین شده‌اند
 user_pending: set[int] = set()
 auth_requested: set[int] = set()   # کاربرانی که برایشان درخواست دسترسی به ادمین فرستاده شده
 admin_pending: dict[int, str] = {}   # chat_id -> نوع ورودی منتظره (limit/channel/allow)
@@ -1062,6 +1063,7 @@ class MTProtoClient:
         self._client = None
         self._loop = None
         self.ready = threading.Event()
+        self._progress = None  # (mb, done) برای نمایش پیشرفت
         self._media: "collections.OrderedDict[tuple[int, int], object]" = collections.OrderedDict()
         self._media_lock = threading.Condition()
 
@@ -1199,47 +1201,45 @@ class MTProtoClient:
                 pass
 
     def download(self, chat_id: int, message_id: int, dest: Path) -> bool:
-        """دانلود مدیای یک پیام با MTProto (بدون سقف ۲۰MB Bot API)."""
+        """دانلود مدیای یک پیام با MTProto (بدون سقف ۲۰MB Bot API) — ضد گیرِ کامل.
+
+        ۱) کش مدیای زندهٔ کلاینت مشترک (پیام‌هایی که همین حالا رسیده‌اند)
+        ۲ و ۳) کلاینت تازهٔ مستقل با event loop خودش در همین ترد — هر تلاش ایزوله است
+        و گیر کردنش هیچ‌وقت کلاینت مشترک را مسموم نمی‌کند؛ همهٔ awaitها ساعت‌چی دارند."""
         import asyncio
         chat_id, message_id = int(chat_id), int(message_id)
         self.last_error = ""
-        if not self.ready.is_set():
-            self.last_error = "کلاینت MTProto آماده نیست"
-            return False
-
-        async def _dl_cached(m) -> bool:
-            return await self._dl_stream(m, dest)
-
-        # ۱) پیام زندهٔ کش‌شده (کاملاً بدون رزولوشن)
-        m = self._take_media(chat_id, message_id, timeout=20.0)
-        if m is not None and self._call(lambda: _dl_cached(m), timeout=1500.0):
-            return True
+        dest = Path(dest)
 
         def _clean_partial():
             try:
-                Path(str(dest)).with_suffix(".part_dl").unlink(missing_ok=True)
-                Path(str(dest)).unlink(missing_ok=True)
+                dest.with_suffix(".part_dl").unlink(missing_ok=True)
+                dest.unlink(missing_ok=True)
             except Exception:  # noqa: BLE001
                 pass
 
-        # ۲) InputPeerUser با hash صفر — برای گفتگوی خصوصی کاربر با ربات
-        try:
-            from telethon.tl.types import InputPeerUser
-            r = self._call(lambda: self._dl_by_peer(InputPeerUser(chat_id, 0),
-                                                    message_id, dest),
-                           timeout=1500.0)
-            if r:
+        # ۱) پیام زندهٔ کش‌شده (کاملاً بدون رزولوشن)
+        m = self._take_media(chat_id, message_id, timeout=20.0)
+        if m is not None:
+            if self._call(lambda: self._dl_stream(m, dest), timeout=1800.0):
+                try:
+                    if self._progress:
+                        self._progress(dest.stat().st_size / 1048576, True)
+                except Exception:  # noqa: BLE001
+                    pass
                 return True
             _clean_partial()
-        except Exception as e:  # noqa: BLE001
-            log(f"مسیر hash=0 ناموفق: {e}")
-            self.last_error = self.last_error or str(e)
-            _clean_partial()
 
-        # ۳) رزولوشن با کش entity Telethon
-        if self._call(lambda: self._dl_by_peer(chat_id, message_id, dest), timeout=1500.0):
-            return True
-        _clean_partial()
+        # ۲ و ۳) دو تلاش با کلاینت تازهٔ مستقل (hash صفر + رزولوشن عمومی)
+        for attempt in (1, 2):
+            if attempt == 2:
+                time.sleep(15.0)
+            ok, err = self._download_fresh(chat_id, message_id, dest)
+            if ok:
+                return True
+            self.last_error = err or self.last_error
+            log(f"دانلود با کلاینت تازه (تلاش {attempt}) ناموفق بود: {err}")
+            _clean_partial()
 
         log(f"دانلود MTProto کامل شکست خورد ({chat_id}/{message_id}): "
             f"{self.last_error or 'پیام پیدا نشد'}")
@@ -1251,6 +1251,75 @@ class MTProtoClient:
         except TgError:
             pass
         return False
+
+    def _download_fresh(self, chat_id: int, message_id: int, dest: Path) -> tuple[bool, str]:
+        """یک تلاش دانلود با کلاینت تازهٔ مستقل (loop خودش) — کامل ایزوله و ساعت‌چی‌دار."""
+        import asyncio
+
+        last_err = ""
+
+        async def _run() -> bool:
+            nonlocal last_err
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+            from telethon.tl.types import InputPeerUser
+            client = TelegramClient(StringSession(), TG_API_ID, TG_API_HASH,
+                                    request_retries=3, connection_retries=3,
+                                    timeout=30)
+            await asyncio.wait_for(client.connect(), timeout=60.0)
+            try:
+                if not await client.is_user_authorized():
+                    await asyncio.wait_for(client.start(bot_token=BOT_TOKEN), timeout=60.0)
+                m = None
+                for peer in (InputPeerUser(int(chat_id), 0), int(chat_id)):
+                    try:
+                        msg = await asyncio.wait_for(
+                            client.get_messages(peer, ids=[int(message_id)]), timeout=90.0)
+                        mm = msg[0] if isinstance(msg, list) else msg
+                        if mm is not None and getattr(mm, "document", None):
+                            m = mm
+                            break
+                    except Exception as e:  # noqa: BLE001
+                        last_err = f"{type(e).__name__}: {e}"
+                if m is None:
+                    raise RuntimeError(last_err or "پیام با این آیدی پیدا نشد")
+                tmp = dest.with_suffix(".part_dl")
+                got = 0
+                last_ui = time.time()
+                with open(tmp, "wb") as f:
+                    it = client.iter_download(m, request_size=512 * 1024,
+                                              chunk_size=512 * 1024)
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(it.__anext__(), timeout=120.0)
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            raise RuntimeError(
+                                f"دانلود متوقف شد — تکه‌ای ظرف ۱۲۰ ثانیه نرسید ({got / 1048576:.0f}MB)")
+                        if chunk:
+                            f.write(chunk)
+                            got += len(chunk)
+                            if self._progress and time.time() - last_ui > 20:
+                                last_ui = time.time()
+                                try:
+                                    self._progress(got / 1048576, False)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                if got <= 0:
+                    raise RuntimeError("هیچ داده‌ای دانلود نشد")
+                tmp.replace(dest)
+                return True
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        try:
+            return bool(asyncio.run(_run())), last_err
+        except Exception as e:  # noqa: BLE001
+            return False, f"{type(e).__name__}: {e}"
 
     async def _dl_by_peer(self, peer, message_id: int, dest: Path) -> bool:
         m = await self._fetch_msg(peer, message_id)
@@ -1935,18 +2004,29 @@ def on_document(m: dict) -> None:
     if job_q.qsize() >= MAX_QUEUE:
         send(chat, "صف ربات پر است؛ چند دقیقه بعد دوباره امتحان کن.")
         return
-    # حذف تکراری: همین فایل (حجم یکسان از همین کاربر) قبلاً صف شده/در جریان است
+    # ضد تکرار هوشمند: اگر همین فایل در حال ترجمه/چک‌پوینت فعال است، رد می‌شود؛
+    # ولی اگر فقط صف شده یا دانلودش گیر کرده، آپلود تازه جایگزینش می‌شود
+    # (پیام تازه = مسیر دانلود زندهٔ MTProto که مطمئن‌ترین راه است).
     with state_lock:
-        dup = any(int((r or {}).get("uid") or -1) == uid and int((r or {}).get("size") or -2) == fsize
-                  and (r or {}).get("status") in ("queued", "ask", "paused", "resuming",
-                                                  "failed_cycle")
-                  for r in (state.get("jobs") or {}).values())
-    if not dup:
-        dup = any(j.get("uid") == uid and j.get("size") == fsize for j in list(job_q.queue))
-    if dup:
+        old_keys = [k for k, r in (state.get("jobs") or {}).items()
+                    if int((r or {}).get("uid") or -1) == uid
+                    and int((r or {}).get("size") or -2) == fsize]
+    in_queue = any(j.get("uid") == uid and j.get("size") == fsize
+                   for j in list(job_q.queue) if j.get("jobkey") not in superseded)
+    protected = [k for k in old_keys
+                 if (k in active_jobs and k not in superseded)
+                 or get_job_record(k).get("status") in ("paused", "resuming")]
+    if protected or (in_queue and not old_keys):
         send(chat, "⏳ همین فایل قبلاً در صف یا حال ترجمه است (خودکار ادامه می‌گیرد)؛ "
                    "نیازی به فرستادن دوباره نیست.")
         return
+    for k in old_keys:
+        if k not in protected:
+            superseded.add(k)
+            drop_job_record(k)
+    if in_queue:
+        # نسخهٔ قدیمی در صف فقط نادیده گرفته می‌شود (حذف از Queue امن نیست)
+        send(chat, "♻️ نسخهٔ قبلیِ همین فایل کنار گذاشته شد؛ همین نسخهٔ تازه را می‌گیرم.")
     user_pending.add(uid)
     jobkey = f"{uid}_{int(time.time())}"
     job_q.put({"chat": chat, "uid": uid, "file_id": doc["file_id"],
@@ -2082,16 +2162,33 @@ def _process_file(job: dict, resume_rec: dict | None = None) -> None:
                         raise RuntimeError("پشتیبانی MTProto برای فایل‌های بزرگ هنوز آماده نیست.")
                     upd(f"⬇️ فایل بزرگ ({fsize / (1024 * 1024):.0f} مگابایت) — دانلود با MTProto…",
                         force=True)
-                    ok_dl = False
-                    for att in range(2):
-                        if MT.download(chat, int(mid or 0), in_pdf):
-                            ok_dl = True
-                            break
-                        if att == 0:
-                            upd("🔁 دانلود ناتمام ماند؛ ۲۰ ثانیه دیگر دوباره امتحان می‌کنم…",
-                                force=True)
-                            time.sleep(20.0)
+
+                    def dl_report(mb: float, done: bool = False) -> None:
+                        with state_lock:
+                            rec = state["jobs"].get(jobkey)
+                            if rec is not None:
+                                rec["dl_mb"] = round(float(mb), 1)
+                        dirty.set()
+                        upd(f"⬇️ دانلود MTProto: {mb:.0f} مگابایت…")
+
+                    MT._progress = dl_report
+                    try:
+                        ok_dl = False
+                        for att in range(2):
+                            if MT.download(chat, int(mid or 0), in_pdf):
+                                ok_dl = True
+                                break
+                            if att == 0:
+                                upd("🔁 دانلود ناتمام ماند؛ ۲۰ ثانیه دیگر دوباره امتحان می‌کنم…",
+                                    force=True)
+                                time.sleep(20.0)
+                    finally:
+                        MT._progress = None
                     if not ok_dl:
+                        upd("❌ دانلود فایل بزرگ از تلگرام ناموفق ماند.\n"
+                            "💡 اگر همین حالا خودِ فایل را یک‌بار دیگر به ربات بفرستی، "
+                            "از مسیر زنده (سریع و مطمئن) دانلود می‌شود؛ رکورد قبلی خودکار کنار می‌رود.",
+                            force=True)
                         raise RuntimeError("دانلود MTProto ناموفق بود.")
                 else:
                     f = api("getFile", file_id=job["file_id"], timeout=30)
@@ -2533,6 +2630,11 @@ def worker() -> None:
             job_q.task_done()
             continue
         job_pause.clear()   # توقفِ کار قبلی نباید به این کار سرایت کند
+        if job.get("jobkey") and job.get("jobkey") in superseded:
+            # این کار با آپلود تازهٔ همان فایل جایگزین شده — نادیده گرفته می‌شود
+            superseded.discard(job.get("jobkey"))
+            job_q.task_done()
+            continue
         worker_busy.set()
         try:
             process_job(job)
